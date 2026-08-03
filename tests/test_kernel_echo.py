@@ -70,6 +70,16 @@ def _drain_iopub(sub, until_idle=True, timeout=10.0):
     raise TimeoutError(f"no idle within {timeout}s; got {[m['msg_type'] for m in out]}")
 
 
+def _await_welcome(sub, timeout=60.0):
+    "Wait for the JEP 65 iopub_welcome: proof the subscription is live, so no later message can be missed."
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not sub.poll(200): continue
+        _, rest = _drain_iopub.sess.feed_identities(sub.recv_multipart())
+        if _drain_iopub.sess.deserialize(rest)["msg_type"] == "iopub_welcome": return
+    raise TimeoutError("no iopub_welcome")
+
+
 def _request(sock, sess, msg_type, content, timeout=10.0):
     sock.send_multipart(sess.serialize(sess.msg(msg_type, content)))
     if not sock.poll(timeout * 1000): raise TimeoutError(f"no reply to {msg_type}")
@@ -92,6 +102,7 @@ def echo_kernel(tmp_path):
     sess = MiniSession(key=key.encode(), username="testclient")
     _drain_iopub.sess = MiniSession(key=key.encode())
     shell, control, sub = _sock(ctx, zmq.DEALER, shell_p), _sock(ctx, zmq.DEALER, control_p), _sock(ctx, zmq.SUB, iopub_p)
+    _await_welcome(sub)
     try: yield proc, sess, shell, control, sub
     finally:
         for s in (shell, control, sub): s.close(0)
