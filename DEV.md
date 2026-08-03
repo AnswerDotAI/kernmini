@@ -36,7 +36,7 @@ Optional members, each a capability the kernel detects with `getattr`:
 
 ## Tests
 
-`pytest -q` runs the unit tests (zmqthread, session, debug infra) plus `tests/test_kernel_echo.py`: a complete kernel built on a trivial echo shell, driven over real sockets by `MiniSession` -- the proof that no IPython is needed. The heavy integration coverage lives deliberately in ipymini's suite (`tests/kernel/`, `tests/compat/`), which exercises this package through a real IPython kernel and unpatched jupyter_client; treat ipymini green as part of kernmini's definition of done. Downstream kernels: ipymini (Python/IPython), iversonnb (J, APL).
+`pytest -q` runs the unit tests (zmqthread, session, debug infra) plus `tests/test_kernel_echo.py`: a complete kernel built on a trivial echo shell, driven over real sockets by `MiniSession` -- the proof that no IPython is needed. The heavy integration coverage lives deliberately in ipymini's suite (`tests/kernel/`, `tests/compat/`), which exercises this package through a real IPython kernel and unpatched jupyter_client; treat ipymini green as part of kernmini's definition of done. Downstream kernels: ipymini (Python/IPython), jnb (J), aplnb (APL, planned).
 
 ## Style and releases
 
