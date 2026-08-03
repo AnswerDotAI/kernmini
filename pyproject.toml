@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kernmini"
+dynamic = ["version"]
+description = "Everything a Jupyter kernel needs except the language"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{name = "Jeremy Howard", email = "github@jhoward.fastmail.fm"}]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+]
+
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "fastship",
+  "build",
+  "twine",
+]
+
+[project.urls]
+Homepage = "https://github.com/AnswerDotAI/kernmini"
+
+[tool.setuptools.dynamic]
+version = { attr = "kernmini.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["kernmini"]
