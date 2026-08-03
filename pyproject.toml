@@ -15,7 +15,7 @@ classifiers = [
   "Programming Language :: Python :: 3 :: Only",
 ]
 
-dependencies = []
+dependencies = ["pyzmq>=25.1", "microio>=0.1.2", "watchpid>=0.1.0", "fastcore>=2.1.6"]
 
 [project.optional-dependencies]
 dev = [
