@@ -8,8 +8,9 @@ See DEV.md for the shell contract; `ipymini` is the reference implementation (IP
 minimal shell needs only `execute`, `execution_count`, `execution_context`, and
 `set_stream_sender`.
 """
+__version__ = "0.1.1"
 
-__version__ = "0.1.0"
+
 
 from .kernel import MiniKernel, run_kernel
 from .session import MiniSession
