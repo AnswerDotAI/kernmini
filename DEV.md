@@ -28,7 +28,7 @@ Optional members, each a capability the kernel detects with `getattr`:
 
 ## Session
 
-`session.MiniSession` is `jupyter_client.Session` trimmed to what a kernel uses (BSD-licensed copy, attribution in the module docstring). Wire-compatible by test (`tests/test_session.py` cross-verifies both directions against jupyter_client when installed; ipymini's compat suite proves it against unpatched real clients). Deliberate simplifications, none changing wire bytes: dates stay ISO strings on deserialize, no v4 adaptation, no fork guard, no zero-copy send threshold. The "Duplicate Signature" ValueError text is load-bearing: the routers match it to drop replays silently.
+`session.MiniSession` is [jupywire](https://github.com/AnswerDotAI/jupywire)'s `Session` (the shared trimmed mirror of `jupyter_client.Session`; BSD attribution and the wire-compatibility story live there) plus the zmq socket halves (`send`/`recv`) and kernel defaults: unsigned unless a key is given, username "kernel". Cross-verification against jupyter_client moved to jupywire's tests; `tests/test_session.py` here keeps the subclass checks, and ipymini's compat suite proves the wire against unpatched real clients. The "Duplicate Signature" ValueError text is load-bearing: the routers match it to drop replays silently.
 
 ## Env vars
 
