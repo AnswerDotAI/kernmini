@@ -31,4 +31,4 @@ Homepage = "https://github.com/AnswerDotAI/kernmini"
 version = { attr = "kernmini.__version__" }
 
 [tool.setuptools.packages.find]
-include = ["kernmini"]
+include = ["kernmini*"]
