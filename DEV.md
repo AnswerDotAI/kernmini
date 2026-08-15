@@ -26,13 +26,22 @@ Optional members, each a capability the kernel detects with `getattr`:
 
 `MiniKernel` kwargs: `comm_manager` (a `comm`-package-style manager; None disables comm handling), `subshells` (False refuses `create_subshell_request` cleanly -- for single-threaded runtimes), `terminate_process_group`.
 
+## Priority and holds
+
+Two execute-metadata extensions, both ours (no Jupyter frontend sends them; unaware kernels and clients are unaffected):
+
+- `priority` (int, default 0): each subshell's cell queue is a `microio.PriorityMailbox` -- highest priority first, FIFO within a level. A request already started is never preempted; priority only reorders what is still queued.
+- `hold` (true): the request emits `execute_input` and then parks instead of executing, holding the queue while an external activity (for solveit, an AI prompt turn) runs elsewhere. While parked, only strictly-higher-priority requests are serviced (the mailbox `floor`). It completes on a `release_request` control message (`{msg_id, status}`; `status: "error"` makes the reply an error, engaging normal `stop_on_error` tail-abort), on interrupt (as `KeyboardInterrupt`, like any cell), or on the `KERNMINI_HOLD_TIMEOUT` backstop. `release_reply` carries `found`: releasing a hold that already completed is a quiet no-op, since the timeout race makes late releases legitimate.
+
+Aborts and the priority queue: the stop-on-error fence (`subshell_abort_clear`) marks a *position*, and the heap has none, so the fence is consumed by the mailbox `gate` -- a hook that sees every item in channel arrival order as it leaves the channel, before the heap can reorder it. The gate also aborts executes arriving inside the abort window, which keeps the contract that a client who has *seen* the error reply can submit again immediately, while stragglers sent before it abort.
+
 ## Session
 
 `session.MiniSession` is [jupywire](https://github.com/AnswerDotAI/jupywire)'s `Session` (the shared trimmed mirror of `jupyter_client.Session`; BSD attribution and the wire-compatibility story live there) plus the zmq socket halves (`send`/`recv`) and kernel defaults: unsigned unless a key is given, username "kernel". Cross-verification against jupyter_client moved to jupywire's tests; `tests/test_session.py` here keeps the subclass checks, and ipymini's compat suite proves the wire against unpatched real clients. The "Duplicate Signature" ValueError text is load-bearing: the routers match it to drop replays silently.
 
 ## Env vars
 
-`KERNMINI_DEBUG`, `KERNMINI_DEBUG_MSGS`, `KERNMINI_CELL_NAME`, `KERNMINI_IOPUB_QMAX`, `KERNMINI_IOPUB_SNDHWM`, `KERNMINI_IOPUB_XPUB`, `KERNMINI_STOP_ON_ERROR_TIMEOUT` -- semantics as documented in ipymini's DEV.md (renamed from `IPYMINI_*` when the code moved here).
+`KERNMINI_DEBUG`, `KERNMINI_DEBUG_MSGS`, `KERNMINI_CELL_NAME`, `KERNMINI_IOPUB_QMAX`, `KERNMINI_IOPUB_SNDHWM`, `KERNMINI_IOPUB_XPUB`, `KERNMINI_STOP_ON_ERROR_TIMEOUT` -- semantics as documented in ipymini's DEV.md (renamed from `IPYMINI_*` when the code moved here), plus `KERNMINI_HOLD_TIMEOUT`: seconds before a parked hold completes as a `HoldTimeout` error (default 3600), the backstop for a client that died owing a release.
 
 ## Tests
 

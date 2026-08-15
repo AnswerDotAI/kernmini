@@ -3,7 +3,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from fastcore.basics import nested_idx, store_attr
-from microio import ActorCore, CloseScope, ScopeGroup, ServiceGroup, WorkTracker
+from microio import ActorCore, CloseScope, PriorityMailbox, ScopeGroup, ServiceGroup, WorkTracker
 from watchpid import watch_parent
 import zmq
 from .session import MiniSession, protocol_version
@@ -37,6 +37,8 @@ def _install_thread_excepthook(kernel: "MiniKernel"):
         kernel.request_stop(f"critical thread crashed: {name}", failed=True)
     threading.excepthook = hook
     return prev
+
+
 subshell_abort_clear = object()
 
 
@@ -121,6 +123,12 @@ def _env_float(name:str, default:float)->float:
     try: return float(raw)
     except ValueError: return log.warning("invalid %s=%r; using %s", name, raw, default) or default
 
+
+def _item_priority(item):
+    "Priority of a queued shell item: execute metadata `priority`, default 0 (non-numeric values from the wire count as 0)"
+    p = nested_idx(item[0], "metadata", "priority")
+    return p if isinstance(p, (int, float)) else 0
+
 class Subshell:
     def __init__(self, kernel: "MiniKernel", subshell_id:str|None, user_ns: dict,
         use_singleton: bool = False, run_in_thread: bool = True):
@@ -133,7 +141,7 @@ class Subshell:
         self.thread = None if not run_in_thread else threading.Thread(target=self._run_loop, daemon=True, name=name)
         self.loop = None
         self.loop_ready = threading.Event()
-        self.actor = ActorCore(self._handle_actor_item, concurrent=True)
+        self.actor = ActorCore(self._handle_actor_item, mailbox=PriorityMailbox(key=_item_priority, gate=self._gate_item), concurrent=True)
         self.aborting = False
         self.abort_handle = None
         self._shell = None
@@ -292,9 +300,6 @@ class Subshell:
 
     async def _handle_actor_item(self, item, release):
         msg, idents = item
-        if msg is subshell_abort_clear:
-            self._stop_aborting()
-            return
         if not msg: return
         msg_type = nested_idx(msg, "header", "msg_type") or "?"
         msg_id = (nested_idx(msg, "header", "msg_id") or "?")[:8]
@@ -333,10 +338,6 @@ class Subshell:
             missing = self._missing_fields(msg_type, msg.get("content", {}))
             if missing:
                 self._send_missing_fields_reply(msg_type, missing, msg, idents)
-                return
-            if msg_type == "execute_request" and self.aborting:
-                dbg(f"ABORTING id={msg_id}")
-                self._send_abort_reply(msg, idents)
                 return
             if msg_type == "execute_request":
                 dbg(f"DISPATCH_EXEC id={msg_id}")
@@ -385,15 +386,24 @@ class Subshell:
         handler(msg, idents)
 
     def _abort_pending_executes(self, append_abort_clear: bool = False):
+        "Abort queued executes; `append_abort_clear` fences the abort window at the channel's current tail, where `_gate_item` consumes it in arrival order"
         drained = self.actor.drain_nowait()
         if append_abort_clear: self.actor.submit((subshell_abort_clear, None))
         for msg, idents in drained:
-            if msg is subshell_abort_clear:
-                self.actor.submit((msg, idents))
-                continue
             msg_type = nested_idx(msg, "header", "msg_type") or None
             if msg_type == "execute_request": self._send_abort_reply(msg, idents)
             elif msg_type: self._dispatch_shell_non_execute(msg, idents)
+
+    def _gate_item(self, item)->bool:
+        "Runs as items leave the mailbox channel, in arrival order (the heap reorders, the channel never does): consume the abort fence, and abort executes inside the abort window"
+        msg, idents = item
+        if msg is subshell_abort_clear:
+            self._stop_aborting()
+            return False
+        if self.aborting and (nested_idx(msg, "header", "msg_type") or None) == "execute_request":
+            self._send_abort_reply(msg, idents)
+            return False
+        return True
 
     def _handle_kernel_info(self, msg: dict, idents: list[bytes]|None):
         with self.kernel.busy_idle(msg):
@@ -414,6 +424,28 @@ class Subshell:
             if running is loop: release()
             else: loop.call_soon_threadsafe(release)
         return _do
+
+    async def _await_hold(self, msg: dict, release)->dict:
+        "Park a held execute until released, interrupted, or timed out; only strictly-higher-priority requests run meanwhile."
+        msg_id = nested_idx(msg, "header", "msg_id")
+        evt, box = asyncio.Event(), {}
+        def _complete(status:str):
+            box["status"] = status
+            evt.set()
+        self.kernel.holds[msg_id] = (self.loop, _complete)
+        mb = self.actor.mailbox
+        prev, mb.floor = mb.floor, _item_priority((msg, None))
+        self._safe_release(release)()
+        try:
+            with self.exec_scopes.scope() as sc:
+                try: await asyncio.wait_for(evt.wait(), self.kernel.hold_timeout)
+                except TimeoutError: return dict(error=_error_content("HoldTimeout", f"no release within {self.kernel.hold_timeout}s"))
+            if sc.cancelled: return dict(error=_error_content("CancelledError", ""))
+        finally:
+            mb.floor = prev
+            self.kernel.holds.pop(msg_id, None)
+        if box.get("status") == "error": return dict(error=_error_content("HoldError", "released with status error"))
+        return {}
 
     async def _handle_execute(self, msg: dict, idents: list[bytes]|None, release):
         msg_id = (nested_idx(msg, "header", "msg_id") or "?")[:8]
@@ -441,16 +473,18 @@ class Subshell:
             if not silent: iopub.execute_input(msg, code=code, execution_count=exec_count_pre)
 
             dbg(f"BRIDGE_EXEC id={msg_id}")
-            timeout_handle = None
-            if _debug:
-                loop = asyncio.get_running_loop()
-                timeout_handle = loop.call_later(2.0, lambda: log.warning("execute still running msg_id=%s", msg_id))
-            try:
-                with self.shell.execution_context(allow_stdin=allow_stdin, silent=silent):
-                    result = await self.shell.execute(code, silent=silent, store_history=store_history,
-                        user_expressions=user_expressions, allow_stdin=allow_stdin)
-            finally:
-                if timeout_handle: timeout_handle.cancel()
+            if nested_idx(msg, "metadata", "hold"): result = await self._await_hold(msg, release)
+            else:
+                timeout_handle = None
+                if _debug:
+                    loop = asyncio.get_running_loop()
+                    timeout_handle = loop.call_later(2.0, lambda: log.warning("execute still running msg_id=%s", msg_id))
+                try:
+                    with self.shell.execution_context(allow_stdin=allow_stdin, silent=silent):
+                        result = await self.shell.execute(code, silent=silent, store_history=store_history,
+                            user_expressions=user_expressions, allow_stdin=allow_stdin)
+                finally:
+                    if timeout_handle: timeout_handle.cancel()
             dbg(f"BRIDGE_DONE id={msg_id}")
 
             error = result.get("error")
@@ -666,13 +700,16 @@ class MiniKernel:
         self.parent_watcher = None
         self.shutdown_restart = None
         self.stop_on_error_timeout = _env_float("KERNMINI_STOP_ON_ERROR_TIMEOUT", 0.0)
+        self.hold_timeout = _env_float("KERNMINI_HOLD_TIMEOUT", 3600.0)
+        self.holds = {}  # msg_id -> (loop, complete) for parked holds, registered by `Subshell._await_hold`
         self.iopub_cmd = None
         self.control_handlers = dict(shutdown_request=self.handle_shutdown, debug_request=self.handle_debug,
             interrupt_request=self.handle_interrupt)
         self.control_specs = dict(kernel_info_request=("kernel_info_reply", lambda msg: self.kernel_info_content()),
             create_subshell_request=("create_subshell_reply", lambda msg: dict(subshell_id=self._create_subshell())),
             list_subshell_request=("list_subshell_reply", lambda msg: dict(subshell_id=self.subshells.list())),
-            delete_subshell_request=("delete_subshell_reply", self._delete_subshell))
+            delete_subshell_request=("delete_subshell_reply", self._delete_subshell),
+            release_request=("release_reply", self._release_hold))
 
     def _set_state(self, state: KernelState):
         with self.state_lock: self.state = state
@@ -939,6 +976,15 @@ class MiniKernel:
             if pgid and pgid == pid and hasattr(os, "killpg"): os.killpg(pgid, signal.SIGINT)
             else: os.kill(pid, signal.SIGINT)
         except OSError as err: log.warning("Interrupt signal failed: %s", err)
+
+    def _release_hold(self, msg: dict)->dict:
+        "Complete a held execute (see `Subshell._await_hold`); a hold already gone is a quiet no-op, reported as `found=False`."
+        c = msg.get("content", {})
+        ent = self.holds.get(c.get("msg_id"))
+        if ent is None: return dict(found=False)
+        loop, complete = ent
+        loop.call_soon_threadsafe(complete, c.get("status", "ok"))
+        return dict(found=True)
 
     def handle_interrupt(self, msg: dict, idents: list[bytes]|None):
         "Handle interrupt_request by signaling subshells."
