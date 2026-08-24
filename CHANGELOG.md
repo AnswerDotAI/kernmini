@@ -1,5 +1,12 @@
 <!-- do not remove -->
 
+## 0.1.4
+
+### Bugs Squashed
+
+- Clear the cancelling window when interrupted work drains instead of at the start of each execute ([#4](https://github.com/AnswerDotAI/kernmini/issues/4))
+
+
 ## 0.1.3
 
 ### New Features
