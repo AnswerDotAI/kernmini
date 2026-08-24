@@ -460,7 +460,6 @@ class Subshell:
         dbg(f"HANDLE_EXEC id={msg_id} code={code[:30]!r}...")
         _unlock_release.set(self._safe_release(release))
         _subshell_var.set(self)
-        self.exec_scopes.clear()  # a new execute ends any previous cancelling window
         self.exec_tracker.add()
         terminal_state = ExecState.COMPLETED
         iopub = self.kernel.iopub
@@ -522,6 +521,7 @@ class Subshell:
             self.kernel.send_status("idle", msg)
             self._set_last_exec_state(terminal_state)
             self.exec_tracker.done()
+            if self.exec_scopes.cancelling and not self.executing.is_set(): self.exec_scopes.clear()  # the interrupted work has drained: close the cancelling window
 
     def _shell_handler(self, msg: dict, idents: list[bytes]|None):
         msg_type = nested_idx(msg, "header", "msg_type") or None
