@@ -802,7 +802,7 @@ class MiniKernel:
         try:
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             os.killpg(pgid, signal.SIGTERM)
-            time.sleep(0.2)
+            time.sleep(0.06)
         except OSError: log.warning("process-group SIGTERM failed", exc_info=True)
         finally: signal.signal(signal.SIGTERM, prev_term)
         os.killpg(pgid, signal.SIGKILL)
