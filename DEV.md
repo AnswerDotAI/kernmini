@@ -92,7 +92,8 @@ The Python wrapper may place a standalone kernel in its own process group. On sh
 - a pure Rust echo language, implemented entirely in the example binary, through the crate API;
 - an IPython shell through the Python adapter.
 
-Rust unit tests cover wire framing, interruption, transport, and language primitives. ipymini's complete protocol and behavior suite is kernmini's main integration test.
+Standalone Rust tests cover wire framing and language interruption primitives. A Python integration test drives a real debugpy session through the DAP
+transport. ipymini's complete protocol and behavior suite is kernmini's main integration test.
 
 ```bash
 cd ../ipymini

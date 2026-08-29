@@ -19,10 +19,15 @@ dependencies = ["loopmini>=0.2.0"]
 
 [project.optional-dependencies]
 dev = [
+  "debugpy>=1.8.21",
   "fastship>=0.0.11",
+  "ipymini>=0.1.20",
   "jupywire>=0.0.1",
   "maturin>=1.0,<2.0",
   "pytest>=9.1.1",
+  "pytest-asyncio",
+  "pytest-timeout",
+  "pytest-xdist",
   "pyzmq>=27.2.0",
 ]
 

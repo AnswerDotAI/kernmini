@@ -177,30 +177,3 @@ async fn read_messages(
         { let _ = complete.send(Ok(message)); }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-    use tokio::net::TcpListener;
-
-    #[tokio::test]
-    async fn dap_client_story() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut stream = BufReader::new(stream);
-            let request = read_message(&mut stream).await.unwrap();
-            let response = json!({"type": "response", "request_seq": request["seq"], "success": true, "body": {"text": "café"}});
-            let event = json!({"type": "event", "event": "initialized"});
-            for message in [response, event] { stream.get_mut().write_all(&encode_message(&message).unwrap()).await.unwrap(); }
-        });
-
-        let (client, mut events) = DapClient::connect(address).await.unwrap();
-        let response = client.request(json!({"type": "request", "command": "test"}), Duration::from_secs(1)).await.unwrap();
-        assert_eq!(response["body"]["text"], "café");
-        assert_eq!(events.recv().await.unwrap()["event"], "initialized");
-        client.close();
-    }
-}
