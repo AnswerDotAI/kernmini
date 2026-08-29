@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "kernmini"
@@ -11,24 +11,38 @@ requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 authors = [{name = "Jeremy Howard", email = "github@jhoward.fastmail.fm"}]
 classifiers = [
-  "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
 ]
 
-dependencies = ["pyzmq>=25.1", "microio>=0.1.4", "watchpid>=0.1.0", "fastcore>=2.1.6", "jupywire>=0.0.1"]
+dependencies = ["loopmini>=0.2.0"]
 
 [project.optional-dependencies]
 dev = [
-  "fastship",
-  "build",
-  "twine",
+  "fastship>=0.0.11",
+  "jupywire>=0.0.1",
+  "maturin>=1.0,<2.0",
+  "pytest>=9.1.1",
+  "pyzmq>=27.2.0",
 ]
 
 [project.urls]
 Homepage = "https://github.com/AnswerDotAI/kernmini"
+Repository = "https://github.com/AnswerDotAI/kernmini"
+Issues = "https://github.com/AnswerDotAI/kernmini/issues"
 
-[tool.setuptools.dynamic]
-version = { attr = "kernmini.__version__" }
+[tool.maturin]
+python-source = "."
+module-name = "kernmini._native"
+features = ["extension-module"]
 
-[tool.setuptools.packages.find]
-include = ["kernmini*"]
+[tool.uv]
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "src/**/*.rs" },
+  { file = "Cargo.toml" },
+  { file = ".git/fastws-cargo-key" },
+]
+
+[tool.fastship]
+branch = "main"

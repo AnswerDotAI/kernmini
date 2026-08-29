@@ -20,11 +20,6 @@ def subshell():
     "Run execute_requests arriving from this cell's client session in a fresh subshell while the body runs."
     sub = _subshell.get()
     if sub is None: raise RuntimeError("subshell() only works inside a cell running under a kernmini kernel")
-    subs = sub.kernel.subshells
-    session = ((sub.kernel.current_parent() or {}).get("header") or {}).get("session")
-    sid = subs.create()
-    try:
-        subs.set_route_override(sid, session)
-        try: yield sid
-        finally: subs.clear_route_override()
-    finally: subs.delete(sid)
+    sid = sub.open_subshell()
+    try: yield sid
+    finally: sub.close_subshell(sid)

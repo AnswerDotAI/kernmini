@@ -2,39 +2,42 @@
 
 Everything a Jupyter kernel needs except the language.
 
-kernmini is the language-agnostic core of a Jupyter kernel: connection files, HMAC-signed wire sessions, the full socket thread cast (shell/control async routers, IOPub with a bounded queue and JEP 65 welcomes, stdin routing, heartbeat), busy/idle and abort discipline, stop-on-error, interrupts, JEP 91 subshells, kernelspec installation, and process lifecycle (signal handling, process-group isolation and teardown, parent-watch crash safety). A kernel author supplies only an executor (the *shell*) and gets a correct, tested kernel around it.
+kernmini is a Rust engine for Jupyter kernels. It owns ZMTP transport, signed Jupyter messages, shell and control routing, IOPub, stdin, heartbeat, execution queues, interrupts, JEP 91 subshells, debugging transport, and process lifecycle. A language supplies execution, completion, inspection, history, and kernel metadata through a small adapter.
 
-[ipymini](https://github.com/AnswerDotAI/ipymini) is the reference kernel (IPython). Its integration suite is kernmini's main proving ground.
+[ipymini](https://github.com/AnswerDotAI/ipymini) is the reference Python kernel. It uses IPython for Python semantics and kernmini for the kernel protocol.
 
-## A complete kernel
+## A complete Python kernel
 
 ```python
-from contextlib import contextmanager
+import sys
 from kernmini import run_kernel
 
+
 class EchoShell:
-    def __init__(self, request_input=None, **kw): self.execution_count,self._stream = 0,None
+    def __init__(self):
+        self.execution_count = 0
+        self.stream = None
 
-    def set_stream_sender(self, sender): self._stream = sender
-
-    @contextmanager
-    def execution_context(self, allow_stdin, silent): yield
+    def set_stream_sender(self, sender): self.stream = sender
 
     def kernel_info(self):
-        return dict(implementation="echokernel", implementation_version="0.0.1", banner="echo",
-            language_info=dict(name="echo", version="1.0", mimetype="text/plain", file_extension=".txt"))
+        return dict(implementation="echo", implementation_version="0.1", banner="echo",
+            language_info=dict(name="echo", version="0.1", mimetype="text/plain", file_extension=".txt"))
 
-    async def execute(self, code, silent=False, store_history=True, user_expressions=None, allow_stdin=False):
+    async def execute(self, code, **kwargs):
         self.execution_count += 1
-        if self._stream: self._stream("stdout", f"echo: {code}\n")
+        if self.stream: self.stream("stdout", f"echo: {code}\n")
         return dict(execution_count=self.execution_count, result={"text/plain": code.upper()})
 
-run_kernel(connection_file, EchoShell, subshells=False)
+
+run_kernel(sys.argv[-1], EchoShell, own_process_group=True)
 ```
 
-That's the whole kernel. Every Jupyter client (JupyterLab, nbclient, jupygate, ...) can now launch it, execute against it, stream its output, and interrupt and shut it down. `kernmini.install_kernelspec(name, argv, display_name, language)` registers it with Jupyter.
+`run_kernel` creates a persistent loopmini event loop and runs the Rust engine until shutdown. The factory is also used to create independent language sessions for JEP 91 subshells. Standalone executables can request process-group ownership, while embedded kernels leave their host process group unchanged by default.
 
-The shell contract is documented in `DEV.md`. Beyond the four members above, everything is opt-in by capability: implement `complete`/`inspect`/`is_complete`/`history` for language services, `debug_request` for a DAP debugger, `interrupt` for language-specific sync interruption, `bind_kernel` for a backref, and pass `subshells=True` when the shell supports concurrent instances.
+Rust language implementations use the `Language` and `LanguageSession` traits directly. `ExecutionContext` provides stream, display, stdin, interrupt, unlock, and temporary-subshell access without exposing Jupyter transport details.
+
+`install_kernelspec(name, argv, display_name, language)` and `install_kernelspec_dir(path, name)` install kernelspecs without requiring jupyter_client.
 
 ## Install
 

@@ -1,0 +1,32 @@
+[package]
+name = "kernmini"
+version = "0.1.5"
+edition = "2024"
+license = "Apache-2.0"
+description = "Everything a Jupyter kernel needs except the language"
+repository = "https://github.com/AnswerDotAI/kernmini"
+include = ["/src/**", "/LICENSE", "/README.md"]
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+hex = "0.4"
+hmac = "0.12"
+libc = { version = "0.2", optional = true }
+pyo3 = { version = "0.29", optional = true }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"], optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+uuid = { version = "1", features = ["v4"] }
+zmtpmini = "0.1.4"
+
+[features]
+python = ["dep:libc", "dep:pyo3", "dep:pyo3-async-runtimes"]
+extension-module = ["python", "pyo3/extension-module"]

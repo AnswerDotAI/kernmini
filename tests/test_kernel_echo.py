@@ -1,10 +1,10 @@
-"End-to-end proof that kernmini runs a kernel with no IPython: a trivial echo shell, driven over real sockets by MiniSession."
+"The Python adapter running a trivial shell over the native kernmini engine."
 
 import json, socket, subprocess, sys, time
 
 import pytest, zmq
 
-from kernmini.session import MiniSession
+from client import MiniSession
 
 RUNNER = '''
 import sys
@@ -38,13 +38,14 @@ class EchoShell:
         return dict(execution_count=self.execution_count, result={"text/plain": code.upper()})
 
 
-run_kernel(sys.argv[-1], EchoShell, subshells=False)
+run_kernel(sys.argv[-1], EchoShell)
 '''
 
 
-def _sock(ctx, typ, port):
+def _sock(ctx, typ, port, identity=None):
     s = ctx.socket(typ)
     s.linger = 0
+    if identity is not None: s.setsockopt(zmq.IDENTITY, identity)
     if typ == zmq.SUB: s.setsockopt(zmq.SUBSCRIBE, b"")
     s.connect(f"tcp://127.0.0.1:{port}")
     return s
@@ -114,14 +115,14 @@ def echo_kernel(tmp_path):
             proc.wait(timeout=5)
 
 
-def test_echo_kernel_end_to_end(echo_kernel):
-    proc, sess, shell, control, sub = echo_kernel
+def echo_kernel_story(kernel, supported_features=None):
+    proc, sess, shell, control, sub = kernel
 
     info = _request(shell, sess, "kernel_info_request", {}, timeout=30)
     assert info["msg_type"] == "kernel_info_reply"
     c = info["content"]
     assert c["implementation"] == "echokernel" and c["language_info"]["name"] == "echo"
-    assert c["supported_features"] == [] and c["debugger"] is False
+    assert c["supported_features"] == (supported_features or []) and c["debugger"] is False
 
     _drain_iopub(sub)  # busy/idle for kernel_info
     reply = _request(shell, sess, "execute_request", dict(code="hello world"))
@@ -142,9 +143,13 @@ def test_echo_kernel_end_to_end(echo_kernel):
     assert proc.wait(timeout=10) in (0, -9)  # group-leader kernels SIGKILL their own process group as the designed last act
 
 
-def _send(sock, sess, msg_type, content, metadata=None):
+def test_echo_kernel_end_to_end(echo_kernel): echo_kernel_story(echo_kernel, ["kernel subshells"])
+
+
+def _send(sock, sess, msg_type, content, metadata=None, subshell_id=None):
     "Send without awaiting the reply; returns the msg_id."
     m = sess.msg(msg_type, content, metadata=metadata)
+    if subshell_id: m["header"]["subshell_id"] = subshell_id
     sock.send_multipart(sess.serialize(m))
     return m["header"]["msg_id"]
 

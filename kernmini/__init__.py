@@ -1,22 +1,20 @@
-"""Everything a Jupyter kernel needs except the language.
+"Everything a Jupyter kernel needs except the language."
 
-kernmini is the language-agnostic core of a Jupyter kernel: connection files, HMAC-signed wire
-sessions, the socket thread cast (shell/control routers, IOPub, stdin, heartbeat), busy/idle and
-abort discipline, interrupts, subshells (JEP 91), and process lifecycle. A kernel supplies a
-*shell*: an execution layer built by the `shell_factory` passed to `MiniKernel`/`run_kernel`.
-See DEV.md for the shell contract; `ipymini` is the reference implementation (IPython), and a
-minimal shell needs only `execute`, `execution_count`, `execution_context`, and
-`set_stream_sender`.
-"""
-__version__ = "0.1.5"
+import asyncio
 
-
-
-
-
-
-
-from .kernel import MiniKernel, run_kernel
-from .session import MiniSession
 from .concur import unlock, subshell
 from .kernelspec import install_kernelspec, install_kernelspec_dir
+
+
+def run_kernel(connection_file, shell_factory, *, own_process_group=False):
+    "Run a Python shell factory as a Jupyter kernel."
+    from ._native import new_event_loop, run_kernel as run_native
+    async def run(): await run_native(connection_file, shell_factory, own_process_group=own_process_group)
+    with asyncio.Runner(loop_factory=new_event_loop) as runner: return runner.run(run())
+
+
+def __getattr__(name):
+    if name == "__version__":
+        from ._native import __version__
+        return __version__
+    raise AttributeError(name)

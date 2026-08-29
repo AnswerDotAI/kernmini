@@ -1,52 +1,100 @@
 # Developer guide
 
-kernmini is the language-agnostic core extracted from `ipymini` (see its DEV.md for the full architecture prose: kernel object graph, life of an execute_request, IOPub semantics, interrupts, startup/shutdown -- all of that machinery now lives here, and that document remains its best narrative description). This guide covers what is specific to kernmini as a standalone package: the shell contract, the capability gates, and the boundaries of the Session copy.
+kernmini is one Rust kernel engine with two language boundaries: native Rust traits and a feature-gated PyO3 adapter. There is no separate Python protocol engine.
 
-## The shell contract
+## Development setup
 
-`MiniKernel(connection_file, shell_factory, ...)` builds one shell per subshell by calling `shell_factory(**kw)` with: `request_input` (callable `(prompt, password) -> str`, routed through the stdin thread), `debug_event_callback`, `zmq_context`, `user_ns` (dict shared across subshells), `use_singleton` (True for the parent subshell), `exec_scopes` (a `microio.ScopeGroup` the kernel cancels on interrupt -- register async work with it to make it interruptible), and `sync_execution_context` (a context manager to wrap synchronous execution so interrupts know to inject rather than cancel). A simple shell accepts what it needs and `**kw`s the rest.
+Kernmini is built by Maturin. In a uv workspace, run `uv sync` after cloning or changing dependency metadata. Rebuild the editable extension after Rust changes:
 
-Required members:
+```bash
+maturin develop
+pytest -q
+```
 
-- `execute(code, silent=, store_history=, user_expressions=, allow_stdin=)` -- awaitable; returns a dict with `execution_count`, and optionally `result` (mime bundle) + `result_metadata`, `error` (`ename`/`evalue`/`traceback`), `user_expressions`, `payload`. Error content is entirely the shell's: each language names its own errors. An `ename` of `KeyboardInterrupt` (or `CancelledError` while an interrupt is in flight) marks the cell aborted.
-- `execution_count` -- int property, read before execution for `execute_input` and for reply defaults.
-- `execution_context(allow_stdin, silent)` -- context manager entered around `execute`; bind per-request IO/capture state here.
-- `set_stream_sender(sender)` -- the kernel hands the shell a `(name, text)` callback publishing IOPub `stream` messages parented to the active request.
+`Cargo.toml` is the version source. The default crate is a reusable `rlib`; Maturin enables `extension-module` to build `kernmini._native`.
 
-Optional members, each a capability the kernel detects with `getattr`:
+## Rust architecture
 
-- `set_display_sender(sender)` -- callback for display events (`display_data`/`update_display_data`/`clear_output` dicts).
-- `complete`/`inspect`/`is_complete` -- language services; missing ones get spec-shaped empty replies.
-- `history(...)` -- history_request; absent means empty history.
-- `debug_request(request_json)` -- DAP bridging; presence advertises `debugger` in kernel_info.
-- `interrupt()` -- full responsibility for interrupting the current execute, however the shell runs it (e.g. a break flag written while the engine blocks in C, polled between statements). Without it, the kernel cancels async executes through `exec_scopes` and injects `KeyboardInterrupt` into the subshell thread via `PyThreadState_SetAsyncExc` for sync ones -- defaults that assume the shell executes Python bytecode.
-- `kernel_info()` -- the shell's contribution to kernel_info_reply (`implementation`, `implementation_version`, `banner`, `language_info`); identity belongs to the language layer, and it can ask the live runtime (e.g. jkernel queries J for its version).
-- `bind_kernel(kernel)` -- called once per shell at construction; ipymini uses it to set `get_ipython().kernel` and bind the process-global comm layer.
-- `output_context()` -- context manager for attributing out-of-band handler output (comms); required only when a `comm_manager` is passed.
+The engine owns connection loading, ZMTP transport, HMAC-signed Jupyter messages, duplicate-signature rejection, shell/control routing, IOPub, stdin, heartbeat, execution scheduling, interruption, subshells, and shutdown.
 
-`MiniKernel` kwargs: `comm_manager` (a `comm`-package-style manager; None disables comm handling), `subshells` (False refuses `create_subshell_request` cleanly -- for single-threaded runtimes), `terminate_process_group`.
+The language boundary has two levels:
 
-## Priority and holds
+- `Language` supplies the parent `LanguageSession` and creates independent child sessions.
+- `LanguageSession` supplies kernel metadata, execution, completion, inspection, completeness, history, comms, debugging, and shutdown.
 
-Two execute-metadata extensions, both ours (no Jupyter frontend sends them; unaware kernels and clients are unaffected):
+Each shell session is driven by one scheduler object which owns its queue, active executions, hold, lock, and interruption state. Shared transport and language handles live in its services object. Output from executions and comm handlers uses the same event pump, so stream, display, buffer, flush, and parent-routing behavior cannot diverge between the two paths.
 
-- `priority` (int, default 0): each subshell's cell queue is a `microio.PriorityMailbox` -- highest priority first, FIFO within a level. A request already started is never preempted; priority only reorders what is still queued.
-- `hold` (true): the request emits `execute_input` and then parks instead of executing, holding the queue while an external activity (for solveit, an AI prompt turn) runs elsewhere. While parked, only strictly-higher-priority requests are serviced (the mailbox `floor`). It completes on a `release_request` control message (`{msg_id, status}`; `status: "error"` makes the reply an error, engaging normal `stop_on_error` tail-abort), on interrupt (as `KeyboardInterrupt`, like any cell), or on the `KERNMINI_HOLD_TIMEOUT` backstop. `release_reply` carries `found`: releasing a hold that already completed is a quiet no-op, since the timeout race makes late releases legitimate.
+An execute receives an `ExecutionContext`. It emits streams and displays, requests stdin, publishes arbitrary messages, observes or registers for interruption, releases the execution queue with `unlock()`, and opens temporary subshell routes. The engine converts these events into correctly parented Jupyter messages.
 
-Aborts and the priority queue: the stop-on-error fence (`subshell_abort_clear`) marks a *position*, and the heap has none, so the fence is consumed by the mailbox `gate` -- a hook that sees every item in channel arrival order as it leaves the channel, before the heap can reorder it. The gate also aborts executes arriving inside the abort window, which keeps the contract that a client who has *seen* the error reply can submit again immediately, while stragglers sent before it abort.
+`run_kernel` installs Tokio SIGINT handling. `run_kernel_with_interrupter` lets an embedding host supply its own `KernelInterrupter`.
 
-## Session
+## Python adapter
 
-`session.MiniSession` is [jupywire](https://github.com/AnswerDotAI/jupywire)'s `Session` (the shared trimmed mirror of `jupyter_client.Session`; BSD attribution and the wire-compatibility story live there) plus the zmq socket halves (`send`/`recv`) and kernel defaults: unsigned unless a key is given, username "kernel". Cross-verification against jupyter_client moved to jupywire's tests; `tests/test_session.py` here keeps the subclass checks, and ipymini's compat suite proves the wire against unpatched real clients. The "Duplicate Signature" ValueError text is load-bearing: the routers match it to drop replays silently.
+The public Python `kernmini.run_kernel(connection_file, shell_factory)` is synchronous. It creates a loopmini loop and runs the PyO3 adapter until kernel shutdown. `_native.run_kernel` is the underlying awaitable used by the wrapper.
 
-## Env vars
+The factory takes no arguments. It creates the parent shell once and a new shell on each child session. Shared language state belongs in the factory closure, as ipymini does for its namespace.
 
-`KERNMINI_DEBUG`, `KERNMINI_DEBUG_MSGS`, `KERNMINI_CELL_NAME`, `KERNMINI_IOPUB_QMAX`, `KERNMINI_IOPUB_SNDHWM`, `KERNMINI_IOPUB_XPUB`, `KERNMINI_STOP_ON_ERROR_TIMEOUT` -- semantics as documented in ipymini's DEV.md (renamed from `IPYMINI_*` when the code moved here), plus `KERNMINI_HOLD_TIMEOUT`: seconds before a parked hold completes as a `HoldTimeout` error (default 3600), the backstop for a client that died owing a release.
+A Python shell provides:
+
+- `execution_count`: current integer execution count.
+- `kernel_info()`: implementation, version, banner, and `language_info`.
+- `execute(code, silent=, store_history=, user_expressions=, allow_stdin=)`: an awaitable returning `execution_count` and optional `result`, `result_metadata`, `error`, `user_expressions`, and `payload`.
+
+The adapter uses optional capabilities when present:
+
+- `set_stream_sender(sender)` and `set_display_sender(sender)` install live output callbacks.
+- `set_input_sender(sender)` installs blocking `(prompt, password) -> str` input routing.
+- `bind_kernel(kernel)` exposes the small kernel proxy expected by IPython integrations.
+- `execution_context(allow_stdin=, silent=)` wraps execution capture.
+- `output_context()` wraps output from comm handlers.
+- `complete`, `inspect`, `is_complete`, and `history` provide language services.
+- `debug_request` and a `debugger.event_callback` provide DAP integration.
+- `comm_info` and `message` provide the language's comm manager and incoming comm dispatch. Kernmini knows nothing about IPython or ipymini comm objects.
+- `comm_manager`, when exposed by the shell, is available through the kernel proxy passed to `bind_kernel`.
+
+The parent shell runs on a persistent loopmini loop in the Python main thread. Child shells run on supervised OS threads with their own persistent loopmini loops. Kernmini's multi-thread Tokio runtime independently drives transport, queues, output, control, and interrupt futures, so synchronous Python cannot block the engine.
+
+`pyo3-async-runtimes` bridges Python awaitables onto their owning loop. Interrupts cancel async cells through that loop and inject `KeyboardInterrupt` into synchronous Python. A child blocked indefinitely in arbitrary C code cannot be interrupted safely; kernmini does not pretend otherwise.
+
+## Execution and concurrency
+
+Each language session owns a serial execute queue. Completion, inspection, history, debugging, comms, and control requests remain responsive while a cell runs.
+
+Two execute metadata extensions are supported:
+
+- `priority` is numeric and defaults to zero. Higher-priority queued cells run first; active execution is never preempted.
+- `hold: true` emits `execute_input` and parks the queue until a control `release_request` arrives. Strictly higher-priority work may pass the hold. An error release or interrupt engages ordinary stop-on-error behavior.
+
+`KERNMINI_HOLD_TIMEOUT` is the hold backstop in seconds and defaults to 3600.
+
+Python code can call `kernmini.unlock()` to release its queue baton while the current cell continues, or use `kernmini.subshell()` to route later requests from that client session through a temporary child.
+
+## Output and stdin
+
+`ExecutionContext` is the single output boundary. The Rust engine associates every stream, display, buffer, stdin request, and arbitrary published message with its execution before sending it over IOPub or stdin. The PyO3 adapter keeps the current context in a ContextVar so Python callbacks and IPython comm handlers reach the correct sink.
+
+`KERNMINI_IOPUB_QMAX` controls the bounded Rust IOPub queue and defaults to 10000.
+Environment configuration is read once when the kernel starts and shared by its parent and child sessions.
+
+## Lifecycle
+
+The Python wrapper may place a standalone kernel in its own process group. On shutdown it terminates that group after protocol cleanup so user-created subprocesses do not survive the kernel. It also watches the original parent PID. Embedders can pass `own_process_group=False` to avoid changing or terminating their host process group.
+
+`LanguageSession::shutdown()` is the asynchronous language lifecycle boundary. Child Python sessions stop their loop and join their thread without blocking a Tokio worker. `Drop` only requests cleanup for exceptional paths.
 
 ## Tests
 
-`pytest -q` runs the unit tests (zmqthread, session, debug infra) plus `tests/test_kernel_echo.py`: a complete kernel built on a trivial echo shell, driven over real sockets by `MiniSession` -- the proof that no IPython is needed. The heavy integration coverage lives deliberately in ipymini's suite (`tests/kernel/`, `tests/compat/`), which exercises this package through a real IPython kernel and unpatched jupyter_client; treat ipymini green as part of kernmini's definition of done. Downstream kernels: ipymini (Python/IPython), jnb (J), aplnb (APL, planned).
+`pytest -q` contains three readable end-to-end stories:
 
-## Style and releases
+- a Python echo shell through the public PyO3 runner;
+- a pure Rust echo language, implemented entirely in the example binary, through the crate API;
+- an IPython shell through the Python adapter.
 
-fastai style (`chkstyle` before committing). Releases via fastship (`ship-changelog` / `ship-release`); the tree carries the next version.
+Rust unit tests cover wire framing, interruption, transport, and language primitives. ipymini's complete protocol and behavior suite is kernmini's main integration test.
+
+```bash
+cd ../ipymini
+pytest -q
+```
+
+Run `cargo test` for the pure Rust surface and `chkstyle` after Python edits.

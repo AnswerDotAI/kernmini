@@ -1,13 +1,7 @@
-"""Jupyter wire-format sessions for a kernel: zmq `send`/`recv` over jupywire's wire core.
-
-The protocol core (message construction, HMAC signing, [de]serialization; adapted from
-jupyter_client, BSD-3-Clause) moved to `jupywire.session` -- one shared mirror for kernmini,
-jupygate, and the kernel clients. This module keeps the zmq socket halves and the kernel
-defaults: unsigned unless a key is given, username "kernel".
-"""
+"Test client using jupywire message framing over pyzmq sockets."
 
 import zmq
-from jupywire.session import DELIM, Session, protocol_version
+from jupywire.session import Session
 
 
 class MiniSession(Session):
