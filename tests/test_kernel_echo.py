@@ -35,6 +35,7 @@ class EchoShell:
             import asyncio
             await asyncio.sleep(float(code[6:]))
         if code == "boom": return dict(execution_count=self.execution_count, error=dict(ename="EchoError", evalue=code, traceback=[]))
+        if code == "bytes": return dict(execution_count=self.execution_count, result={"image/png": b"raw"})
         return dict(execution_count=self.execution_count, result={"text/plain": code.upper()})
 
 
@@ -144,6 +145,14 @@ def echo_kernel_story(kernel, supported_features=None):
 
 
 def test_echo_kernel_end_to_end(echo_kernel): echo_kernel_story(echo_kernel, ["kernel subshells"])
+
+
+def test_python_adapter_binary_result(echo_kernel):
+    _,sess,shell,_,sub = echo_kernel
+    reply = _request(shell, sess, "execute_request", dict(code="bytes"))
+    msgs = _drain_iopub(sub)
+    result, = (m for m in msgs if m["msg_type"] == "execute_result")
+    assert reply["content"]["status"] == "ok" and result["content"]["data"]["image/png"] == "cmF3"
 
 
 def _send(sock, sess, msg_type, content, metadata=None, subshell_id=None):

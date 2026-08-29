@@ -33,7 +33,7 @@ class EchoShell:
 run_kernel(sys.argv[-1], EchoShell, own_process_group=True)
 ```
 
-`run_kernel` creates a persistent loopmini event loop and runs the Rust engine until shutdown. The factory is also used to create independent language sessions for JEP 91 subshells. Standalone executables can request process-group ownership, while embedded kernels leave their host process group unchanged by default.
+`run_kernel` creates a persistent asyncio event loop and runs the Rust engine until shutdown. It uses loopmini when installed and the standard asyncio loop otherwise; `loop_factory=` can select one explicitly. The factory is also used to create independent language sessions for JEP 91 subshells. Standalone executables can request process-group ownership, while embedded kernels leave their host process group unchanged by default.
 
 Rust language implementations use the `Language` and `LanguageSession` traits directly. `ExecutionContext` provides stream, display, stdin, interrupt, unlock, and temporary-subshell access without exposing Jupyter transport details.
 

@@ -15,7 +15,7 @@ classifiers = [
   "Programming Language :: Python :: Implementation :: CPython",
 ]
 
-dependencies = ["loopmini>=0.2.0"]
+dependencies = ["fastcore>=2.2.17"]
 
 [project.optional-dependencies]
 dev = [
@@ -23,6 +23,7 @@ dev = [
   "fastship>=0.0.11",
   "ipymini>=0.1.20",
   "jupywire>=0.0.1",
+  "loopmini>=0.2.0",
   "maturin>=1.0,<2.0",
   "pytest>=9.1.1",
   "pytest-asyncio",

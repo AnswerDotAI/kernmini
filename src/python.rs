@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 pub(crate) fn py_to_json(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Value> {
-    let text: String = py.import("json")?.call_method1("dumps", (value,))?.extract()?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("default", py.import("fastcore.nbio")?.getattr("jupyter_json_default")?)?;
+    let text: String = py.import("json")?.call_method("dumps", (value,), Some(&kwargs))?.extract()?;
     serde_json::from_str(&text).map_err(|error| PyRuntimeError::new_err(error.to_string()))
 }
 
@@ -175,11 +177,6 @@ impl DisplayRouter {
 
 fn context_var(py: Python<'_>) -> PyResult<Py<PyAny>> { Ok(py.import("kernmini._bridge")?.getattr("_current")?.unbind()) }
 
-fn shared_event_loop(py: Python<'_>) -> PyResult<Py<PyAny>> { Ok(py.import("loopmini")?.getattr("new_event_loop")?.call0()?.unbind()) }
-
-#[pyfunction]
-fn new_event_loop(py: Python<'_>) -> PyResult<Py<PyAny>> { shared_event_loop(py) }
-
 struct ChildLoop { event_loop: Mutex<Option<Py<PyAny>>>, thread: Mutex<Option<JoinHandle<()>>> }
 
 impl ChildLoop {
@@ -269,7 +266,7 @@ impl PyLanguageSession {
     }
 }
 
-struct PyLanguage { factory: Py<PyAny>, parent: PyLanguageSession }
+struct PyLanguage { factory: Py<PyAny>, loop_factory: Py<PyAny>, parent: PyLanguageSession }
 
 #[async_trait]
 impl Language for PyLanguage {
@@ -281,6 +278,7 @@ impl Language for PyLanguage {
 
     async fn create_child(&self) -> anyhow::Result<Self::Session> {
         let factory = Python::attach(|py| self.factory.clone_ref(py));
+        let loop_factory = Python::attach(|py| self.loop_factory.clone_ref(py));
         let child_loop = Arc::new(ChildLoop::new());
         let thread_loop = child_loop.clone();
         let (created, result) = tokio::sync::oneshot::channel();
@@ -288,7 +286,7 @@ impl Language for PyLanguage {
             let mut created = Some(created);
             let outcome = Python::attach(|py| -> PyResult<()> {
                 let asyncio = py.import("asyncio")?;
-                let event_loop = shared_event_loop(py)?;
+                let event_loop = loop_factory.call0(py)?;
                 asyncio.call_method1("set_event_loop", (&event_loop,))?;
                 *thread_loop.event_loop.lock().expect("child loop lock poisoned") = Some(event_loop.clone_ref(py));
                 let target = factory.call0(py)?;
@@ -438,8 +436,10 @@ impl LanguageSession for PyLanguageSession {
 }
 
 #[pyfunction]
-#[pyo3(signature = (connection_file, factory, own_process_group=false))]
-fn run_kernel<'py>(py: Python<'py>, connection_file: String, factory: Py<PyAny>, own_process_group: bool) -> PyResult<Bound<'py, PyAny>> {
+#[pyo3(signature = (connection_file, factory, loop_factory, own_process_group=false))]
+fn run_kernel<'py>(
+    py: Python<'py>, connection_file: String, factory: Py<PyAny>, loop_factory: Py<PyAny>, own_process_group: bool,
+) -> PyResult<Bound<'py, PyAny>> {
     #[cfg(unix)]
     let owns_process_group = own_process_group
         && unsafe {
@@ -455,7 +455,7 @@ fn run_kernel<'py>(py: Python<'py>, connection_file: String, factory: Py<PyAny>,
     let signal = py.import("signal")?;
     let signal_router = Py::new(py, SignalRouter { interrupt: interrupt.clone(), target: target.clone_ref(py) })?;
     signal.call_method1("signal", (signal.getattr("SIGINT")?, signal_router))?;
-    let language = PyLanguage { parent: PyLanguageSession::new(py, target)?, factory };
+    let language = PyLanguage { parent: PyLanguageSession::new(py, target)?, factory, loop_factory };
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         #[cfg(unix)]
         let result = if owns_process_group {
@@ -488,7 +488,6 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     runtime.enable_all().worker_threads(2);
     pyo3_async_runtimes::tokio::init(runtime);
     crate::python_dap::register(module)?;
-    module.add_function(wrap_pyfunction!(new_event_loop, module)?)?;
     module.add_function(wrap_pyfunction!(run_kernel, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())

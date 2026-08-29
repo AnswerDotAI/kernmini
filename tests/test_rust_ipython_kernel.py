@@ -11,7 +11,7 @@ from test_kernel_echo import _await_welcome, _drain_iopub, _ports, _replies, _re
 RUNNER = '''
 import asyncio, sys
 from ipymini.shell import MiniShell
-from kernmini._native import new_event_loop, run_kernel
+from kernmini._native import run_kernel
 
 
 async def main():
@@ -21,10 +21,10 @@ async def main():
         shell = MiniShell(request_input=lambda *_: "", user_ns=user_ns, use_singleton=first)
         first = False
         return shell
-    await run_kernel(sys.argv[-1], shell_factory)
+    await run_kernel(sys.argv[-1], shell_factory, asyncio.new_event_loop)
 
 
-with asyncio.Runner(loop_factory=new_event_loop) as runner: runner.run(main())
+with asyncio.Runner() as runner: runner.run(main())
 '''
 
 

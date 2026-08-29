@@ -32,7 +32,7 @@ An execute receives an `ExecutionContext`. It emits streams and displays, reques
 
 ## Python adapter
 
-The public Python `kernmini.run_kernel(connection_file, shell_factory)` is synchronous. It creates a loopmini loop and runs the PyO3 adapter until kernel shutdown. `_native.run_kernel` is the underlying awaitable used by the wrapper.
+The public Python `kernmini.run_kernel(connection_file, shell_factory)` is synchronous. It uses loopmini when available, falls back to the standard asyncio loop, and accepts an explicit `loop_factory`. `_native.run_kernel` is the underlying awaitable used by the wrapper.
 
 The factory takes no arguments. It creates the parent shell once and a new shell on each child session. Shared language state belongs in the factory closure, as ipymini does for its namespace.
 
@@ -54,7 +54,7 @@ The adapter uses optional capabilities when present:
 - `comm_info` and `message` provide the language's comm manager and incoming comm dispatch. Kernmini knows nothing about IPython or ipymini comm objects.
 - `comm_manager`, when exposed by the shell, is available through the kernel proxy passed to `bind_kernel`.
 
-The parent shell runs on a persistent loopmini loop in the Python main thread. Child shells run on supervised OS threads with their own persistent loopmini loops. Kernmini's multi-thread Tokio runtime independently drives transport, queues, output, control, and interrupt futures, so synchronous Python cannot block the engine.
+The parent shell runs on a persistent asyncio loop in the Python main thread. Child shells run on supervised OS threads with their own persistent loops created by the same factory. Kernmini's multi-thread Tokio runtime independently drives transport, queues, output, control, and interrupt futures, so synchronous Python cannot block the engine.
 
 `pyo3-async-runtimes` bridges Python awaitables onto their owning loop. Interrupts cancel async cells through that loop and inject `KeyboardInterrupt` into synchronous Python. A child blocked indefinitely in arbitrary C code cannot be interrupted safely; kernmini does not pretend otherwise.
 
