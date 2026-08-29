@@ -1,6 +1,6 @@
 [package]
 name = "kernmini"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 license = "Apache-2.0"
 description = "Everything a Jupyter kernel needs except the language"
