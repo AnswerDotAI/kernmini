@@ -11,12 +11,12 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-fn py_to_json(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Value> {
+pub(crate) fn py_to_json(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Value> {
     let text: String = py.import("json")?.call_method1("dumps", (value,))?.extract()?;
     serde_json::from_str(&text).map_err(|error| PyRuntimeError::new_err(error.to_string()))
 }
 
-fn json_to_py(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> { Ok(py.import("json")?.call_method1("loads", (value.to_string(),))?.unbind()) }
+pub(crate) fn json_to_py(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> { Ok(py.import("json")?.call_method1("loads", (value.to_string(),))?.unbind()) }
 
 fn py_buffers(value: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<u8>>> {
     if value.is_none() { return Ok(vec![]); }
@@ -187,9 +187,7 @@ impl ChildLoop {
 
     fn stop(&self) {
         let Some(event_loop) = self.event_loop.lock().expect("child loop lock poisoned").take() else { return };
-        Python::attach(|py| {
-            if let Ok(stop) = event_loop.getattr(py, "stop") { let _ = event_loop.call_method1(py, "call_soon_threadsafe", (stop,)); }
-        });
+        Python::attach(|py| { if let Ok(stop) = event_loop.getattr(py, "stop") { let _ = event_loop.call_method1(py, "call_soon_threadsafe", (stop,)); } });
     }
 
     async fn shutdown(&self) -> anyhow::Result<()> {
@@ -325,9 +323,7 @@ impl LanguageSession for PyLanguageSession {
         .map_err(|error| anyhow::anyhow!(error.to_string()))
     }
 
-    fn execution_count(&self) -> u64 {
-        Python::attach(|py| self.target.getattr(py, "execution_count").and_then(|value| value.extract(py))).unwrap_or(0)
-    }
+    fn execution_count(&self) -> u64 { Python::attach(|py| self.target.getattr(py, "execution_count").and_then(|value| value.extract(py))).unwrap_or(0) }
 
     fn supports_debugger(&self) -> bool { Python::attach(|py| self.target.bind(py).hasattr("debug_request")).unwrap_or(false) }
 
@@ -369,8 +365,7 @@ impl LanguageSession for PyLanguageSession {
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
 
         let result = future.await;
-        let value =
-            Python::attach(|py| -> PyResult<Value> { py_to_json(py, result?.bind(py)) }).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let value = Python::attach(|py| -> PyResult<Value> { py_to_json(py, result?.bind(py)) }).map_err(|error| anyhow::anyhow!(error.to_string()))?;
 
         if let Some(streams) = value.get("streams").and_then(Value::as_array) {
             for stream in streams { context.stream(stream["name"].as_str().unwrap_or("stdout"), stream["text"].as_str().unwrap_or("")); }
@@ -379,10 +374,7 @@ impl LanguageSession for PyLanguageSession {
         let mut error = value.get("error").filter(|error| !error.is_null()).map(|error| LanguageError {
             ename: error["ename"].as_str().unwrap_or("Error").to_owned(),
             evalue: error["evalue"].as_str().unwrap_or("").to_owned(),
-            traceback: error["traceback"]
-                .as_array()
-                .map(|lines| lines.iter().filter_map(Value::as_str).map(str::to_owned).collect())
-                .unwrap_or_default(),
+            traceback: error["traceback"].as_array().map(|lines| lines.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default(),
         });
         if interrupted.load(AtomicOrdering::Acquire) && error.as_ref().is_some_and(|error| error.ename == "CancelledError") {
             error = Some(LanguageError { ename: "KeyboardInterrupt".into(), evalue: "".into(), traceback: vec![] });
@@ -414,7 +406,10 @@ impl LanguageSession for PyLanguageSession {
     async fn debug(&self, request: Value) -> anyhow::Result<Value> {
         let target = Python::attach(|py| self.target.clone_ref(py));
         tokio::task::spawn_blocking(move || {
-            Python::attach(|py| -> PyResult<Value> { py_to_json(py, target.call_method1(py, "debug_request", (request.to_string(),))?.bind(py)) })
+            Python::attach(|py| -> PyResult<Value> {
+                let request = json_to_py(py, &request)?;
+                py_to_json(py, target.call_method1(py, "debug_request", (request,))?.bind(py))
+            })
         })
         .await?
         .map_err(|error| anyhow::anyhow!(error.to_string()))
@@ -492,6 +487,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     let mut runtime = tokio::runtime::Builder::new_multi_thread();
     runtime.enable_all().worker_threads(2);
     pyo3_async_runtimes::tokio::init(runtime);
+    crate::python_dap::register(module)?;
     module.add_function(wrap_pyfunction!(new_event_loop, module)?)?;
     module.add_function(wrap_pyfunction!(run_kernel, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;

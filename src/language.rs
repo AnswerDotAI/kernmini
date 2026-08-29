@@ -194,9 +194,7 @@ pub trait LanguageSession: Clone + Send + Sync + 'static {
     async fn complete(&self, request: CompleteRequest) -> anyhow::Result<Value> {
         Ok(json!({"status": "ok", "matches": [], "cursor_start": request.cursor_pos, "cursor_end": request.cursor_pos, "metadata": {}}))
     }
-    async fn inspect(&self, _request: InspectRequest) -> anyhow::Result<Value> {
-        Ok(json!({"status": "ok", "found": false, "data": {}, "metadata": {}}))
-    }
+    async fn inspect(&self, _request: InspectRequest) -> anyhow::Result<Value> { Ok(json!({"status": "ok", "found": false, "data": {}, "metadata": {}})) }
     async fn is_complete(&self, _code: String) -> anyhow::Result<Value> { Ok(json!({"status": "unknown"})) }
     async fn history(&self, _request: Value) -> anyhow::Result<Value> { Ok(json!({"status": "ok", "history": []})) }
     async fn comm_info(&self, _request: Value) -> anyhow::Result<Value> { Ok(json!({"status": "ok", "comms": {}})) }

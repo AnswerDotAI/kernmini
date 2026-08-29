@@ -45,12 +45,7 @@ impl RouterPeers {
 
 pub struct Inbound { pub message: Message, pub reply: ReplySink, pub identity: Bytes }
 
-pub async fn serve_router(
-    listener: TcpListener,
-    session: Session,
-    incoming: mpsc::Sender<Inbound>,
-    peers: Option<RouterPeers>,
-) -> anyhow::Result<()> {
+pub async fn serve_router(listener: TcpListener, session: Session, incoming: mpsc::Sender<Inbound>, peers: Option<RouterPeers>) -> anyhow::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let session = session.clone();

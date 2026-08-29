@@ -37,6 +37,8 @@ run_kernel(sys.argv[-1], EchoShell, own_process_group=True)
 
 Rust language implementations use the `Language` and `LanguageSession` traits directly. `ExecutionContext` provides stream, display, stdin, interrupt, unlock, and temporary-subshell access without exposing Jupyter transport details.
 
+`DapClient` is the optional language-neutral debugger transport: framed TCP, request correlation, timeouts, asynchronous events, and shutdown. Language adapters retain debugger startup, request policy, source mapping, and variable semantics.
+
 `install_kernelspec(name, argv, display_name, language)` and `install_kernelspec_dir(path, name)` install kernelspecs without requiring jupyter_client.
 
 ## Install

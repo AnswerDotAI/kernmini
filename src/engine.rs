@@ -302,9 +302,7 @@ impl Eq for QueueItem {}
 impl PartialOrd for QueueItem { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
 
 impl Ord for QueueItem {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.priority.partial_cmp(&other.priority).unwrap_or(Ordering::Equal).then_with(|| other.order.cmp(&self.order))
-    }
+    fn cmp(&self, other: &Self) -> Ordering { self.priority.partial_cmp(&other.priority).unwrap_or(Ordering::Equal).then_with(|| other.order.cmp(&self.order)) }
 }
 
 enum ShellOutcome { Continue, Shutdown }
@@ -422,11 +420,7 @@ async fn handle_shell(services: &ShellServices<impl LanguageSession>, inbound: I
     }
 }
 
-async fn run_execution(
-    services: ShellServices<impl LanguageSession>,
-    inbound: Inbound,
-    interrupt: ExecutionInterrupt,
-) -> anyhow::Result<ExecutionDone> {
+async fn run_execution(services: ShellServices<impl LanguageSession>, inbound: Inbound, interrupt: ExecutionInterrupt) -> anyhow::Result<ExecutionDone> {
     let request = inbound.message;
     let msg_id = request.msg_id().to_owned();
     let stop_on_error = request.content.get("stop_on_error").and_then(Value::as_bool).unwrap_or(true);
@@ -568,8 +562,7 @@ impl<L: LanguageSession> Shell<L> {
                 self.interrupting = true;
                 for interrupt in self.active.values() { let _ = interrupt.request(); }
                 if let Some(held) = self.held.take() {
-                    finish_hold(self.services.language.execution_count(), &self.services.iopub, &self.services.session, held.item, "interrupt")
-                        .await?;
+                    finish_hold(self.services.language.execution_count(), &self.services.iopub, &self.services.session, held.item, "interrupt").await?;
                 }
                 self.abort_pending().await?;
             }
@@ -775,11 +768,7 @@ pub async fn run_kernel(connection_file: impl AsRef<Path>, language: impl Langua
     result
 }
 
-pub async fn run_kernel_with_interrupter(
-    connection_file: impl AsRef<Path>,
-    language: impl Language,
-    interrupt: KernelInterrupter,
-) -> anyhow::Result<()> {
+pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, language: impl Language, interrupt: KernelInterrupter) -> anyhow::Result<()> {
     let config = KernelConfig::from_env();
     let connection = ConnectionInfo::read(connection_file)?;
     let connection_content = Arc::new(json!({

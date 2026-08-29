@@ -28,6 +28,8 @@ An execute receives an `ExecutionContext`. It emits streams and displays, reques
 
 `run_kernel` installs Tokio SIGINT handling. `run_kernel_with_interrupter` lets an embedding host supply its own `KernelInterrupter`.
 
+`DapClient` is independent of the kernel engine and reusable by any language adapter. It owns DAP's `Content-Length` TCP framing, sequence allocation, pending responses, timeouts, asynchronous events, and connection teardown. The language adapter owns debugger startup and language-specific request handling.
+
 ## Python adapter
 
 The public Python `kernmini.run_kernel(connection_file, shell_factory)` is synchronous. It creates a loopmini loop and runs the PyO3 adapter until kernel shutdown. `_native.run_kernel` is the underlying awaitable used by the wrapper.
@@ -48,7 +50,7 @@ The adapter uses optional capabilities when present:
 - `execution_context(allow_stdin=, silent=)` wraps execution capture.
 - `output_context()` wraps output from comm handlers.
 - `complete`, `inspect`, `is_complete`, and `history` provide language services.
-- `debug_request` and a `debugger.event_callback` provide DAP integration.
+- `debug_request` and a `debugger.event_callback` provide language-specific DAP integration; `kernmini._native.DapClient` is the optional shared transport.
 - `comm_info` and `message` provide the language's comm manager and incoming comm dispatch. Kernmini knows nothing about IPython or ipymini comm objects.
 - `comm_manager`, when exposed by the shell, is available through the kernel proxy passed to `bind_kernel`.
 
