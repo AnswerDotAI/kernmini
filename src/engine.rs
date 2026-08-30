@@ -8,7 +8,7 @@ use crate::wire::{Message, Session};
 use bytes::Bytes;
 use serde_json::{Value, json};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, hash_map::Entry};
+use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -114,7 +114,6 @@ struct ShellServices<L> {
     connection: Arc<Value>,
     supports_subshells: bool,
     config: KernelConfig,
-    unlocks: mpsc::UnboundedSender<String>,
     subshells: mpsc::UnboundedSender<SessionCommand>,
 }
 
@@ -122,14 +121,13 @@ impl<L: LanguageSession> ShellServices<L> {
     fn output_context(&self, request: &Message, identity: Option<Bytes>, silent: bool, interrupt: ExecutionInterrupt) -> ExecutionContext {
         let (events, mut output) = event_channel(self.config.iopub_capacity);
         let execution = identity.is_some();
-        let unlock = execution.then(|| (request.msg_id().to_owned(), self.unlocks.clone()));
         let client_session = request.header.get("session").and_then(Value::as_str).unwrap_or("").to_owned();
         let subshells = execution.then(|| (client_session, self.subshells.clone()));
         let parent = json!({
             "header": request.header, "parent_header": request.parent_header,
             "metadata": request.metadata, "content": request.content,
         });
-        let context = ExecutionContext::new(events, interrupt, unlock, subshells, parent);
+        let context = ExecutionContext::new(events, interrupt, subshells, parent);
         let iopub = self.iopub.clone();
         let session = self.session.clone();
         let request = request.clone();
@@ -492,13 +490,13 @@ async fn wait_hold(deadline: Option<tokio::time::Instant>) {
     if let Some(deadline) = deadline { tokio::time::sleep_until(deadline).await } else { std::future::pending().await }
 }
 
-fn pop_runnable(queue: &mut BinaryHeap<QueueItem>, execution_locked: bool, held: Option<&Held>) -> Option<QueueItem> {
+fn pop_runnable(queue: &mut BinaryHeap<QueueItem>, execution_active: bool, held: Option<&Held>) -> Option<QueueItem> {
     let mut parked = vec![];
     let runnable = loop {
         let Some(item) = queue.pop() else { break None };
         let execute = item.inbound.message.msg_type() == "execute_request";
         let above_hold = held.is_none_or(|hold| item.priority > hold.item.priority);
-        if !execute || (!execution_locked && above_hold) { break Some(item); }
+        if !execute || (!execution_active && above_hold) { break Some(item); }
         parked.push(item);
     };
     queue.extend(parked);
@@ -512,8 +510,6 @@ struct Shell<L: LanguageSession> {
     queue: BinaryHeap<QueueItem>,
     order: u64,
     held: Option<Held>,
-    locked: Option<String>,
-    unlocks: mpsc::UnboundedReceiver<String>,
     executions: JoinSet<anyhow::Result<ExecutionDone>>,
     active: HashMap<String, ExecutionInterrupt>,
     stopping: Option<oneshot::Sender<()>>,
@@ -538,8 +534,6 @@ impl<L: LanguageSession> Shell<L> {
         self.queue.extend(keep);
         Ok(())
     }
-
-    fn unlock(&mut self, msg_id: Option<String>) { if self.locked.as_deref() == msg_id.as_deref() { self.locked = None } }
 
     async fn apply_control(&mut self, control: ShellControl) -> anyhow::Result<()> {
         match control {
@@ -573,7 +567,6 @@ impl<L: LanguageSession> Shell<L> {
 
     async fn execution_done(&mut self, done: ExecutionDone) -> anyhow::Result<()> {
         self.active.remove(&done.msg_id);
-        if self.locked.as_deref() == Some(done.msg_id.as_str()) { self.locked = None }
         if done.failed && done.stop_on_error && !self.interrupting { self.abort_pending().await? }
         Ok(())
     }
@@ -608,7 +601,6 @@ impl<L: LanguageSession> Shell<L> {
             let interrupt = ExecutionInterrupt::default();
             self.active.insert(msg_id.clone(), interrupt.clone());
             self.executions.spawn(run_execution(self.services.clone(), item.inbound, interrupt));
-            self.locked = Some(msg_id);
         }
         Ok(false)
     }
@@ -617,7 +609,6 @@ impl<L: LanguageSession> Shell<L> {
         loop {
             while let Ok(inbound) = self.incoming.try_recv() { self.enqueue(inbound) }
             while let Ok(control) = self.controls.try_recv() { self.apply_control(control).await? }
-            while let Ok(msg_id) = self.unlocks.try_recv() { self.unlock(Some(msg_id)) }
             while let Some(result) = self.executions.try_join_next() { self.execution_done(result??).await? }
             if self.interrupting && self.executions.is_empty() { self.interrupting = false }
             if self.stopping.is_some() && self.queue.is_empty() && self.executions.is_empty() && self.held.is_none() {
@@ -626,7 +617,7 @@ impl<L: LanguageSession> Shell<L> {
                 return Ok(());
             }
 
-            if let Some(item) = pop_runnable(&mut self.queue, self.locked.is_some(), self.held.as_ref()) {
+            if let Some(item) = pop_runnable(&mut self.queue, !self.executions.is_empty(), self.held.as_ref()) {
                 if self.handle_item(item).await? { return Ok(()); }
                 continue;
             }
@@ -634,7 +625,6 @@ impl<L: LanguageSession> Shell<L> {
             tokio::select! {
                 message = self.incoming.recv() => self.enqueue(message.ok_or_else(|| anyhow::anyhow!("shell service ended"))?),
                 control = self.controls.recv() => self.apply_control(control.ok_or_else(|| anyhow::anyhow!("shell control ended"))?).await?,
-                unlocked = self.unlocks.recv() => self.unlock(unlocked),
                 result = self.executions.join_next(), if !self.executions.is_empty() => {
                     self.execution_done(result.expect("non-empty execution set")??).await?;
                 }
@@ -665,7 +655,6 @@ impl KernelServices {
     fn spawn_shell(&self, language: impl LanguageSession) -> ShellHandle {
         let (incoming, requests) = mpsc::channel(256);
         let (controls, shell_controls) = mpsc::channel(64);
-        let (unlock_send, unlocks) = mpsc::unbounded_channel();
         let services = ShellServices {
             language,
             iopub: self.iopub.clone(),
@@ -674,7 +663,6 @@ impl KernelServices {
             connection: self.connection.clone(),
             supports_subshells: self.supports_subshells,
             config: self.config,
-            unlocks: unlock_send,
             subshells: self.subshells.clone(),
         };
         let shell = Shell {
@@ -684,8 +672,6 @@ impl KernelServices {
             queue: BinaryHeap::new(),
             order: 0,
             held: None,
-            locked: None,
-            unlocks,
             executions: JoinSet::new(),
             active: HashMap::new(),
             stopping: None,
@@ -697,13 +683,11 @@ impl KernelServices {
 
 fn subshell_id(request: &Message) -> &str { request.header.get("subshell_id").and_then(Value::as_str).filter(|id| !id.is_empty()).unwrap_or("") }
 
-async fn reply_subshell_not_found(iopub: &Iopub, session: &Session, inbound: Inbound) -> anyhow::Result<()> {
+async fn reply_subshell_error(iopub: &Iopub, session: &Session, inbound: Inbound, ename: &str, evalue: String) -> anyhow::Result<()> {
     let request = inbound.message;
     if !request.msg_type().ends_with("_request") { return Ok(()); }
-    let id = subshell_id(&request);
     let mut content = json!({
-        "status": "error", "ename": "SubshellNotFound",
-        "evalue": format!("Unknown subshell_id {id:?}"), "traceback": [],
+        "status": "error", "ename": ename, "evalue": evalue, "traceback": [],
     });
     if request.msg_type() == "execute_request" {
         content["execution_count"] = json!(0);
@@ -718,9 +702,16 @@ async fn reply_subshell_not_found(iopub: &Iopub, session: &Session, inbound: Inb
     Ok(())
 }
 
-async fn route_shell(
+async fn reply_subshell_not_found(iopub: &Iopub, session: &Session, inbound: Inbound) -> anyhow::Result<()> {
+    let id = subshell_id(&inbound.message).to_owned();
+    reply_subshell_error(iopub, session, inbound, "SubshellNotFound", format!("Unknown subshell_id {id:?}")).await
+}
+
+async fn route_shell<L: Language>(
     inbound: Inbound,
-    shells: &HashMap<String, ShellHandle>,
+    language: &L,
+    services: &KernelServices,
+    shells: &mut HashMap<String, ShellHandle>,
     route_overrides: &HashMap<String, String>,
     iopub: &Iopub,
     session: &Session,
@@ -728,6 +719,11 @@ async fn route_shell(
     let explicit = subshell_id(&inbound.message);
     let client_session = inbound.message.header.get("session").and_then(Value::as_str).unwrap_or("");
     let id = if !explicit.is_empty() { explicit.to_owned() } else if inbound.message.msg_type() == "execute_request" { route_overrides.get(client_session).cloned().unwrap_or_default() } else { String::new() };
+    if !explicit.is_empty() && !shells.contains_key(&id) {
+        if let Err(error) = create_subshell(language, services, shells, Some(id.clone())).await {
+            return reply_subshell_error(iopub, session, inbound, "SubshellCreationError", error.to_string()).await;
+        }
+    }
     if let Some(target) = shells.get(&id) {
         if let Err(error) = target.incoming.send(inbound).await { reply_subshell_not_found(iopub, session, error.0).await? }
     }
@@ -735,14 +731,16 @@ async fn route_shell(
     Ok(())
 }
 
-async fn route_pending_shells(
+async fn route_pending_shells<L: Language>(
     shell: &mut mpsc::Receiver<Inbound>,
-    shells: &HashMap<String, ShellHandle>,
+    language: &L,
+    services: &KernelServices,
+    shells: &mut HashMap<String, ShellHandle>,
     route_overrides: &HashMap<String, String>,
     iopub: &Iopub,
     session: &Session,
 ) -> anyhow::Result<()> {
-    while let Ok(inbound) = shell.try_recv() { route_shell(inbound, shells, route_overrides, iopub, session).await? }
+    while let Ok(inbound) = shell.try_recv() { route_shell(inbound, language, services, shells, route_overrides, iopub, session).await? }
     Ok(())
 }
 
@@ -757,6 +755,20 @@ async fn stop_shell(shell: ShellHandle, interrupt: bool) {
 async fn interrupt_shells(stdin: &Stdin, shells: &HashMap<String, ShellHandle>) {
     stdin.interrupt().await;
     for shell in shells.values() { let _ = shell.controls.send(ShellControl::Interrupt).await; }
+}
+
+async fn create_subshell(
+    language: &impl Language,
+    services: &KernelServices,
+    shells: &mut HashMap<String, ShellHandle>,
+    requested_id: Option<String>,
+) -> anyhow::Result<String> {
+    let id = requested_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    if id.is_empty() { anyhow::bail!("subshell_id cannot be empty") }
+    if shells.contains_key(&id) { return Ok(id); }
+    let child = language.create_child().await?;
+    shells.insert(id.clone(), services.spawn_shell(child));
+    Ok(id)
 }
 
 pub async fn run_kernel(connection_file: impl AsRef<Path>, language: impl Language) -> anyhow::Result<()> {
@@ -829,33 +841,31 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
             }
             message = shell.recv() => {
                 let inbound = message.ok_or_else(|| anyhow::anyhow!("shell service ended"))?;
-                route_shell(inbound, &shells, &route_overrides, &iopub, &session).await?;
+                route_shell(inbound, &language, &kernel_services, &mut shells, &route_overrides, &iopub, &session).await?;
                 continue;
             }
             command = subshell_commands.recv() => {
                 match command.ok_or_else(|| anyhow::anyhow!("subshell command service ended"))? {
-                    SessionCommand::Open { client_session, complete } => {
-                        let result = match route_overrides.entry(client_session) {
-                            Entry::Occupied(_) => Err(anyhow::anyhow!("this client session already has a temporary subshell")),
-                            Entry::Vacant(route) => match language.create_child().await {
-                                Ok(child) => {
-                                    let id = uuid::Uuid::new_v4().to_string();
-                                    shells.insert(id.clone(), kernel_services.spawn_shell(child));
-                                    route.insert(id.clone());
-                                    Ok(id)
-                                }
-                                Err(error) => Err(error),
-                            },
+                    SessionCommand::Open { client_session, subshell_id, complete } => {
+                        let result = if route_overrides.contains_key(&client_session) {
+                            Err(anyhow::anyhow!("this client session already has a subshell route"))
+                        } else {
+                            create_subshell(&language, &kernel_services, &mut shells, subshell_id).await.map(|id| {
+                                route_overrides.insert(client_session, id.clone());
+                                id
+                            })
                         };
                         let _ = complete.send(result);
                     }
-                    SessionCommand::Close { client_session, subshell_id, complete } => {
+                    SessionCommand::Close { client_session, subshell_id, delete, complete } => {
                         let result = if route_overrides.get(&client_session) == Some(&subshell_id) {
                             route_overrides.remove(&client_session);
-                            if let Some(shell) = shells.remove(&subshell_id) { stop_shell(shell, false).await }
+                            if delete {
+                                if let Some(shell) = shells.remove(&subshell_id) { stop_shell(shell, false).await }
+                            }
                             Ok(())
                         } else {
-                            Err(anyhow::anyhow!("temporary subshell is not active"))
+                            Err(anyhow::anyhow!("subshell route is not active"))
                         };
                         let _ = complete.send(result);
                     }
@@ -875,7 +885,7 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
                 return Ok(());
             }
             "interrupt_request" => {
-                route_pending_shells(&mut shell, &shells, &route_overrides, &iopub, &session).await?;
+                route_pending_shells(&mut shell, &language, &kernel_services, &mut shells, &route_overrides, &iopub, &session).await?;
                 interrupt_shells(&stdin, &shells).await;
                 send_reply(&reply, &session, &request, "interrupt_reply", json!({"status": "ok"})).await?;
             }
@@ -893,12 +903,9 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
                     .await?;
                     continue;
                 }
-                let id = uuid::Uuid::new_v4().to_string();
-                let content = match language.create_child().await {
-                    Ok(child) => {
-                        shells.insert(id.clone(), kernel_services.spawn_shell(child));
-                        json!({"status": "ok", "subshell_id": id})
-                    }
+                let requested_id = request.content.get("subshell_id").and_then(Value::as_str).map(str::to_owned);
+                let content = match create_subshell(&language, &kernel_services, &mut shells, requested_id).await {
+                    Ok(id) => json!({"status": "ok", "subshell_id": id}),
                     Err(error) => json!({"status": "error", "ename": "SubshellCreationError", "evalue": error.to_string(), "traceback": []}),
                 };
                 send_reply(&reply, &session, &request, "create_subshell_reply", content).await?;
@@ -917,7 +924,7 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
                 send_reply(&reply, &session, &request, "delete_subshell_reply", content).await?;
             }
             "release_request" => {
-                route_pending_shells(&mut shell, &shells, &route_overrides, &iopub, &session).await?;
+                route_pending_shells(&mut shell, &language, &kernel_services, &mut shells, &route_overrides, &iopub, &session).await?;
                 let msg_id = request.content.get("msg_id").and_then(Value::as_str).unwrap_or("").to_owned();
                 let release_status = request.content.get("status").and_then(Value::as_str).unwrap_or("ok").to_owned();
                 let mut found = false;
