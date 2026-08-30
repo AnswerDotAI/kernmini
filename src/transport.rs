@@ -94,7 +94,9 @@ pub async fn serve_router(listener: TcpListener, session: Session, incoming: mps
             }
             .await;
             if let (Some(peers), Some((identity, reply))) = (&peers, registered) { peers.remove(&identity, &reply).await }
-            if let Err(error) = result { eprintln!("router peer ended: {error:#}") }
+            if let Err(error) = result
+                && !matches!(error.downcast_ref::<zmtpmini::Error>(), Some(zmtpmini::Error::Closed))
+            { eprintln!("router peer ended: {error:#}") }
         });
     }
 }
@@ -164,7 +166,9 @@ pub async fn serve_heartbeat(listener: TcpListener) -> anyhow::Result<()> {
                 }
             }
             .await;
-            if let Err(error) = result { eprintln!("heartbeat peer ended: {error:#}") }
+            if let Err(error) = result
+                && !matches!(error.downcast_ref::<zmtpmini::Error>(), Some(zmtpmini::Error::Closed))
+            { eprintln!("heartbeat peer ended: {error:#}") }
         });
     }
 }

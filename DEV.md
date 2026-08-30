@@ -17,6 +17,8 @@ pytest -q
 
 The engine owns connection loading, ZMTP transport, HMAC-signed Jupyter messages, duplicate-signature rejection, shell/control routing, IOPub, stdin, heartbeat, execution scheduling, interruption, subshells, and shutdown.
 
+Router and heartbeat peers are independent connection tasks. Ordinary peer EOF removes any router registration and ends silently; genuine I/O, handshake, and protocol failures are reported on kernel stderr.
+
 The language boundary has two levels:
 
 - `Language` supplies the parent `LanguageSession` and creates independent child sessions.
