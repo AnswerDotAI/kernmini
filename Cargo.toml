@@ -30,3 +30,20 @@ zmtpmini = "0.1.4"
 [features]
 python = ["dep:libc", "dep:pyo3", "dep:pyo3-async-runtimes"]
 extension-module = ["python", "pyo3/extension-module"]
+
+[profile.release]
+lto = false
+codegen-units = 16
+
+[profile.release.package.kernmini]
+incremental = true
+
+[profile.dist]
+inherits = "release"
+lto = true
+incremental = false
+codegen-units = 1
+strip = true
+
+[profile.dist.package.kernmini]
+incremental = false
