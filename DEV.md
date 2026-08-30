@@ -92,8 +92,10 @@ The Python wrapper may place a standalone kernel in its own process group. On sh
 - a pure Rust echo language, implemented entirely in the example binary, through the crate API;
 - an IPython shell through the Python adapter.
 
-Standalone Rust tests cover wire framing and language interruption primitives. A Python integration test drives a real debugpy session through the DAP
-transport. ipymini's complete protocol and behavior suite is kernmini's main integration test.
+`ConKernelClient` launches each kernel and manages its Jupyter requests, replies, IOPub messages, stdin, and shutdown. Tests use live protocol events to
+synchronize concurrent behavior rather than sleeps or hand-written socket draining. Standalone Rust tests cover wire framing and language interruption
+primitives. A Python integration test drives a real debugpy session through the DAP transport directly, since that transport is the subject of the test.
+ipymini's complete protocol and behavior suite is kernmini's main integration test.
 
 ```bash
 cd ../ipymini

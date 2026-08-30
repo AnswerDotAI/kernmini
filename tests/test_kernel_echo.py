@@ -1,252 +1,135 @@
 "The Python adapter running a trivial shell over the native kernmini engine."
 
-import json, socket, subprocess, sys, time
+import asyncio, os, sys
+from pathlib import Path
 
-import pytest, zmq
-
-from client import MiniSession
-
-RUNNER = '''
-import sys
-from contextlib import contextmanager
-from kernmini import run_kernel
+import pytest
+from conkernelclient import JmsgQueues, run_kernel
+from jupywire.ops import parent_id
 
 
-class EchoShell:
-    "The minimal shell contract: execute, execution_count, execution_context, set_stream_sender."
-
-    def __init__(self, request_input=None, **kw):
-        self.execution_count = 0
-        self._stream = None
-
-    def set_stream_sender(self, sender): self._stream = sender
-
-    @contextmanager
-    def execution_context(self, allow_stdin, silent): yield
-
-    def kernel_info(self):
-        return dict(implementation="echokernel", implementation_version="0.0.1", banner="echo",
-            language_info=dict(name="echo", version="1.0", mimetype="text/plain", file_extension=".txt"))
-
-    async def execute(self, code, silent=False, store_history=True, user_expressions=None, allow_stdin=False):
-        self.execution_count += 1
-        if self._stream: self._stream("stdout", f"echo: {code}\\n")
-        if code.startswith("sleep:"):
-            import asyncio
-            await asyncio.sleep(float(code[6:]))
-        if code == "boom": return dict(execution_count=self.execution_count, error=dict(ename="EchoError", evalue=code, traceback=[]))
-        if code == "bytes": return dict(execution_count=self.execution_count, result={"image/png": b"raw"})
-        return dict(execution_count=self.execution_count, result={"text/plain": code.upper()})
+ROOT = Path(__file__).parents[1]
+ECHO_ARGV = [sys.executable, str(ROOT/'tests'/'echo_kernel.py'), "{connection_file}"]
 
 
-run_kernel(sys.argv[-1], EchoShell)
-'''
+async def _run(kc, code, **kw): return [m async for m in kc.run(code, timeout=30, **kw)]
+def _one(msgs, msg_type): return next(m for m in msgs if m['msg_type'] == msg_type)
+def _pubs(msgs): return [m for m in msgs if m['channel'] == 'iopub']
 
 
-def _sock(ctx, typ, port, identity=None):
-    s = ctx.socket(typ)
-    s.linger = 0
-    if identity is not None: s.setsockopt(zmq.IDENTITY, identity)
-    if typ == zmq.SUB: s.setsockopt(zmq.SUBSCRIBE, b"")
-    s.connect(f"tcp://127.0.0.1:{port}")
-    return s
-
-
-def _ports(n):
-    socks = [socket.socket() for _ in range(n)]
-    for s in socks: s.bind(("127.0.0.1", 0))
-    ports = [s.getsockname()[1] for s in socks]
-    for s in socks: s.close()
-    return ports
-
-
-def _drain_iopub(sub, until_idle=True, timeout=10.0):
-    "Collect iopub msg dicts until an idle status (skipping the welcome)."
-    sess, out = _drain_iopub.sess, []
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not sub.poll(200): continue
-        frames = sub.recv_multipart()
-        idents, rest = sess.feed_identities(frames)
-        msg = sess.deserialize(rest)
-        if msg["msg_type"] == "iopub_welcome": continue
+async def _until_stream(run, text):
+    out = []
+    while True:
+        msg = await anext(run)
         out.append(msg)
-        if until_idle and msg["msg_type"] == "status" and msg["content"]["execution_state"] == "idle": return out
-    raise TimeoutError(f"no idle within {timeout}s; got {[m['msg_type'] for m in out]}")
+        if msg['msg_type'] == 'stream' and msg['content']['text'] == text: return out
 
 
-def _await_welcome(sub, timeout=60.0):
-    "Wait for the JEP 65 iopub_welcome: proof the subscription is live, so no later message can be missed."
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not sub.poll(200): continue
-        _, rest = _drain_iopub.sess.feed_identities(sub.recv_multipart())
-        if _drain_iopub.sess.deserialize(rest)["msg_type"] == "iopub_welcome": return
-    raise TimeoutError("no iopub_welcome")
+async def _busy(qs, msg_id):
+    return await qs.jmsg_for('status', pred=lambda m: parent_id(m) == msg_id and m['content']['execution_state'] == 'busy', queue='iopub', timeout=10)
 
 
-def _request(sock, sess, msg_type, content, timeout=10.0):
-    sock.send_multipart(sess.serialize(sess.msg(msg_type, content)))
-    if not sock.poll(timeout * 1000): raise TimeoutError(f"no reply to {msg_type}")
-    idents, rest = sess.feed_identities(sock.recv_multipart())
-    return sess.deserialize(rest)
+def _watch(waiter, order):
+    task = asyncio.ensure_future(waiter)
+    def _done(task):
+        if not task.cancelled() and task.exception() is None: order.append(parent_id(task.result()))
+    task.add_done_callback(_done)
+    return task
 
 
-@pytest.fixture
-def echo_kernel(tmp_path):
-    key = "test-key-123"
-    shell_p, iopub_p, stdin_p, control_p, hb_p = _ports(5)
-    conn = dict(transport="tcp", ip="127.0.0.1", shell_port=shell_p, iopub_port=iopub_p, stdin_port=stdin_p,
-        control_port=control_p, hb_port=hb_p, key=key, signature_scheme="hmac-sha256")
-    cf = tmp_path / "conn.json"
-    cf.write_text(json.dumps(conn))
-    runner = tmp_path / "echo_runner.py"
-    runner.write_text(RUNNER)
-    proc = subprocess.Popen([sys.executable, str(runner), str(cf)], stderr=subprocess.PIPE)
-    ctx = zmq.Context.instance()
-    sess = MiniSession(key=key.encode(), username="testclient")
-    _drain_iopub.sess = MiniSession(key=key.encode())
-    shell, control, sub = _sock(ctx, zmq.DEALER, shell_p), _sock(ctx, zmq.DEALER, control_p), _sock(ctx, zmq.SUB, iopub_p)
-    _await_welcome(sub)
-    try: yield proc, sess, shell, control, sub
-    finally:
-        for s in (shell, control, sub): s.close(0)
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+async def echo_kernel_story(kc, supported_features=None, binary=False):
+    info = await kc.cmd.kernel_info(timeout=30)
+    content = info['content']
+    assert info['msg_type'] == 'kernel_info_reply'
+    assert content['implementation'] == 'echokernel' and content['language_info']['name'] == 'echo'
+    assert content['supported_features'] == (supported_features or []) and content['debugger'] is False
+
+    msgs = await _run(kc, 'hello world')
+    reply = _one(msgs, 'execute_reply')
+    pubs = _pubs(msgs)
+    assert reply['content']['status'] == 'ok' and reply['content']['execution_count'] == 1
+    assert [m['msg_type'] for m in pubs] == ['status', 'execute_input', 'stream', 'execute_result', 'status']
+    assert pubs[2]['content']['text'] == 'echo: hello world\n'
+    assert pubs[3]['content']['data']['text/plain'] == 'HELLO WORLD'
+
+    msgs = await _run(kc, 'boom')
+    assert _one(msgs, 'execute_reply')['content']['status'] == 'error'
+    assert _one(msgs, 'error')['content']['ename'] == 'EchoError'
+
+    if binary:
+        msgs = await _run(kc, 'bytes')
+        assert _one(msgs, 'execute_reply')['content']['status'] == 'ok'
+        assert _one(msgs, 'execute_result')['content']['data']['image/png'] == 'cmF3'
 
 
-def echo_kernel_story(kernel, supported_features=None):
-    proc, sess, shell, control, sub = kernel
+async def execution_queue_story(kc):
+    qs = JmsgQueues(kc)
 
-    info = _request(shell, sess, "kernel_info_request", {}, timeout=30)
-    assert info["msg_type"] == "kernel_info_reply"
-    c = info["content"]
-    assert c["implementation"] == "echokernel" and c["language_info"]["name"] == "echo"
-    assert c["supported_features"] == (supported_features or []) and c["debugger"] is False
+    # Once the sleeper has emitted output it owns the execution lane; priority then overtakes normal.
+    sleeper_id = kc.new_msg_id()
+    sleeper = kc.run('sleep:0.2', msg_id=sleeper_id, timeout=5)
+    await _until_stream(sleeper, 'echo: sleep:0.2\n')
+    order = []
+    normal_id, priority_id = kc.new_msg_id(), kc.new_msg_id()
+    normal = _watch(kc.reply('normal', msg_id=normal_id, timeout=5), order)
+    priority = _watch(kc.reply('priority', msg_id=priority_id, metadata=dict(priority=1), timeout=5), order)
+    async for _ in sleeper: pass
+    await asyncio.gather(normal, priority)
+    assert order == [priority_id, normal_id]
 
-    _drain_iopub(sub)  # busy/idle for kernel_info
-    reply = _request(shell, sess, "execute_request", dict(code="hello world"))
-    msgs = _drain_iopub(sub)
-    assert reply["content"]["status"] == "ok" and reply["content"]["execution_count"] == 1
-    kinds = [m["msg_type"] for m in msgs]
-    assert kinds == ["status", "execute_input", "stream", "execute_result", "status"]
-    assert msgs[2]["content"]["text"] == "echo: hello world\n"
-    assert msgs[3]["content"]["data"]["text/plain"] == "HELLO WORLD"
+    # A hold parks normal work, lets priority through, and completes on release.
+    order = []
+    held_id, normal_id, priority_id = (kc.new_msg_id() for _ in range(3))
+    held = _watch(kc.reply('', msg_id=held_id, metadata=dict(hold=True), timeout=5), order)
+    await _busy(qs, held_id)
+    normal = _watch(kc.reply('normal', msg_id=normal_id, timeout=5), order)
+    priority = _watch(kc.reply('priority', msg_id=priority_id, metadata=dict(priority=1), timeout=5), order)
+    assert (await priority)['content']['status'] == 'ok' and order == [priority_id]
+    assert (await kc.ctl.release(msg_id=held_id, timeout=5))['content']['found'] is True
+    held_reply, normal_reply = await asyncio.gather(held, normal)
+    assert [held_reply['content']['status'], normal_reply['content']['status']] == ['ok', 'ok']
+    assert order == [priority_id, held_id, normal_id]
+    assert (await kc.ctl.release(msg_id=held_id, timeout=5))['content']['found'] is False
 
-    reply = _request(shell, sess, "execute_request", dict(code="boom"))
-    msgs = _drain_iopub(sub)
-    assert reply["content"]["status"] == "error" and reply["content"]["ename"] == "EchoError"
-    assert any(m["msg_type"] == "error" for m in msgs)
+    # A priority barrier proves the normal tail reached the shell queue before control releases the hold as an error.
+    order = []
+    held_id, normal_id, barrier_id = (kc.new_msg_id() for _ in range(3))
+    held = _watch(kc.reply('', msg_id=held_id, metadata=dict(hold=True), timeout=5), order)
+    await _busy(qs, held_id)
+    normal = _watch(kc.reply('normal', msg_id=normal_id, timeout=5), order)
+    barrier = _watch(kc.reply('barrier', msg_id=barrier_id, metadata=dict(priority=1), timeout=5), order)
+    await barrier
+    await kc.ctl.release(msg_id=held_id, status='error', timeout=5)
+    held_reply, normal_reply = await asyncio.gather(held, normal)
+    assert (held_reply['content']['status'], held_reply['content']['ename']) == ('error', 'HoldError')
+    assert normal_reply['content']['status'] == 'aborted'
+    assert order == [barrier_id, held_id, normal_id]
 
-    reply = _request(control, sess, "shutdown_request", dict(restart=False))
-    assert reply["content"]["status"] == "ok"
-    assert proc.wait(timeout=10) in (0, -9)  # group-leader kernels SIGKILL their own process group as the designed last act
-
-
-def test_echo_kernel_end_to_end(echo_kernel): echo_kernel_story(echo_kernel, ["kernel subshells"])
-
-
-def test_python_adapter_binary_result(echo_kernel):
-    _,sess,shell,_,sub = echo_kernel
-    reply = _request(shell, sess, "execute_request", dict(code="bytes"))
-    msgs = _drain_iopub(sub)
-    result, = (m for m in msgs if m["msg_type"] == "execute_result")
-    assert reply["content"]["status"] == "ok" and result["content"]["data"]["image/png"] == "cmF3"
-
-
-def _send(sock, sess, msg_type, content, metadata=None, subshell_id=None):
-    "Send without awaiting the reply; returns the msg_id."
-    m = sess.msg(msg_type, content, metadata=metadata)
-    if subshell_id: m["header"]["subshell_id"] = subshell_id
-    sock.send_multipart(sess.serialize(m))
-    return m["header"]["msg_id"]
-
-
-def _replies(sock, sess, n, timeout=10.0):
-    "Collect `n` shell replies in arrival order as (parent_msg_id, content) pairs."
-    out, deadline = [], time.monotonic() + timeout
-    while len(out) < n and time.monotonic() < deadline:
-        if not sock.poll(200): continue
-        _, rest = sess.feed_identities(sock.recv_multipart())
-        msg = sess.deserialize(rest)
-        out.append((msg["parent_header"]["msg_id"], msg["content"]))
-    assert len(out) == n, f"expected {n} replies, got {len(out)}"
-    return out
-
-
-def test_priority_and_hold(echo_kernel):
-    proc, sess, shell, control, sub = echo_kernel
-    _request(shell, sess, "kernel_info_request", {}, timeout=30)
-    _drain_iopub(sub)
-
-    # priority: a queued higher-priority execute overtakes a queued normal one
-    mid_s = _send(shell, sess, "execute_request", dict(code="sleep:0.3"))
-    time.sleep(0.1)  # the sleeper takes the baton; the next two queue behind it
-    mid_a = _send(shell, sess, "execute_request", dict(code="a"))
-    mid_b = _send(shell, sess, "execute_request", dict(code="b"), metadata=dict(priority=1))
-    order = [mid for mid, c in _replies(shell, sess, 3)]
-    assert order == [mid_s, mid_b, mid_a], "priority 1 must overtake the queued normal execute"
-
-    # hold: parks the queue; higher priority passes, normal waits, release completes
-    mid_h = _send(shell, sess, "execute_request", dict(code=""), metadata=dict(hold=True))
-    time.sleep(0.1)
-    mid_x = _send(shell, sess, "execute_request", dict(code="x"))
-    mid_y = _send(shell, sess, "execute_request", dict(code="y"), metadata=dict(priority=1))
-    (got_y, c_y), = _replies(shell, sess, 1)
-    assert got_y == mid_y and c_y["status"] == "ok", "priority 1 must run during the hold"
-    rel = _request(control, sess, "release_request", dict(msg_id=mid_h))
-    assert rel["content"]["status"] == "ok" and rel["content"]["found"] is True
-    (got_h, c_h), (got_x, c_x) = _replies(shell, sess, 2)
-    assert (got_h, c_h["status"]) == (mid_h, "ok"), "release completes the hold"
-    assert (got_x, c_x["status"]) == (mid_x, "ok"), "the parked normal execute runs after release"
-    rel = _request(control, sess, "release_request", dict(msg_id=mid_h))
-    assert rel["content"]["found"] is False, "a completed hold is gone; late release is a quiet no-op"
-
-    # release with status=error: the hold errors and aborts the queued tail
-    mid_h2 = _send(shell, sess, "execute_request", dict(code=""), metadata=dict(hold=True))
-    time.sleep(0.1)
-    mid_z = _send(shell, sess, "execute_request", dict(code="z"))
-    time.sleep(0.1)  # let z reach the shell queue: control and shell are separate sockets with no cross-channel ordering
-    _request(control, sess, "release_request", dict(msg_id=mid_h2, status="error"))
-    (got_h2, c_h2), (got_z, c_z) = _replies(shell, sess, 2)
-    assert (got_h2, c_h2["status"], c_h2["ename"]) == (mid_h2, "error", "HoldError")
-    assert (got_z, c_z["status"]) == (mid_z, "aborted"), "an error hold aborts the queued tail"
-
-    # interrupt during a hold: the hold aborts, and so does the queued tail
-    mid_h3 = _send(shell, sess, "execute_request", dict(code=""), metadata=dict(hold=True))
-    time.sleep(0.1)
-    mid_w = _send(shell, sess, "execute_request", dict(code="w"))
-    time.sleep(0.1)  # as above: w must be queued before the interrupt lands
-    _request(control, sess, "interrupt_request", {})
-    (got_h3, c_h3), (got_w, c_w) = _replies(shell, sess, 2)
-    assert (got_h3, c_h3["status"], c_h3["ename"]) == (mid_h3, "error", "KeyboardInterrupt")
-    assert (got_w, c_w["status"]) == (mid_w, "aborted")
+    # The same barrier makes interrupt ordering deterministic.
+    order = []
+    held_id, normal_id, barrier_id = (kc.new_msg_id() for _ in range(3))
+    held = _watch(kc.reply('', msg_id=held_id, metadata=dict(hold=True), timeout=5), order)
+    await _busy(qs, held_id)
+    normal = _watch(kc.reply('normal', msg_id=normal_id, timeout=5), order)
+    barrier = _watch(kc.reply('barrier', msg_id=barrier_id, metadata=dict(priority=1), timeout=5), order)
+    await barrier
+    await kc.interrupt(timeout=5)
+    held_reply, normal_reply = await asyncio.gather(held, normal)
+    assert (held_reply['content']['status'], held_reply['content']['ename']) == ('error', 'KeyboardInterrupt')
+    assert normal_reply['content']['status'] == 'aborted'
+    assert order == [barrier_id, held_id, normal_id]
 
 
-def test_hold_timeout(tmp_path):
-    key = "test-key-123"
-    shell_p, iopub_p, stdin_p, control_p, hb_p = _ports(5)
-    conn = dict(transport="tcp", ip="127.0.0.1", shell_port=shell_p, iopub_port=iopub_p, stdin_port=stdin_p,
-        control_port=control_p, hb_port=hb_p, key=key, signature_scheme="hmac-sha256")
-    cf = tmp_path / "conn.json"
-    cf.write_text(json.dumps(conn))
-    runner = tmp_path / "echo_runner.py"
-    runner.write_text(RUNNER)
-    import os
-    env = os.environ | dict(KERNMINI_HOLD_TIMEOUT="0.2")
-    proc = subprocess.Popen([sys.executable, str(runner), str(cf)], stderr=subprocess.PIPE, env=env)
-    ctx = zmq.Context.instance()
-    sess = MiniSession(key=key.encode(), username="testclient")
-    _drain_iopub.sess = MiniSession(key=key.encode())
-    shell, control, sub = _sock(ctx, zmq.DEALER, shell_p), _sock(ctx, zmq.DEALER, control_p), _sock(ctx, zmq.SUB, iopub_p)
-    try:
-        _await_welcome(sub)
-        mid_h = _send(shell, sess, "execute_request", dict(code=""), metadata=dict(hold=True))
-        (got_h, c_h), = _replies(shell, sess, 1, timeout=5)
-        assert (got_h, c_h["status"], c_h["ename"]) == (mid_h, "error", "HoldTimeout")
-    finally:
-        for s in (shell, control, sub): s.close(0)
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=5)
+@pytest.mark.asyncio
+async def test_python_adapter_story():
+    async with run_kernel('echo', ECHO_ARGV) as (_, kc):
+        await echo_kernel_story(kc, ['kernel subshells'], binary=True)
+        await execution_queue_story(kc)
+
+
+@pytest.mark.asyncio
+async def test_hold_timeout():
+    env = os.environ | dict(KERNMINI_HOLD_TIMEOUT='0.2')
+    async with run_kernel('echo', ECHO_ARGV, env=env) as (_, kc):
+        reply = await kc.reply('', metadata=dict(hold=True), timeout=5)
+        assert (reply['content']['status'], reply['content']['ename']) == ('error', 'HoldTimeout')
