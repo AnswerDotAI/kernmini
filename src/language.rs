@@ -59,8 +59,8 @@ pub(crate) enum ContextMessage {
 }
 
 pub(crate) enum SessionCommand {
-    Open { client_session: String, complete: std::sync::mpsc::SyncSender<anyhow::Result<String>> },
-    Close { client_session: String, subshell_id: String, complete: std::sync::mpsc::SyncSender<anyhow::Result<()>> },
+    Open { client_session: String, subshell_id: Option<String>, complete: std::sync::mpsc::SyncSender<anyhow::Result<String>> },
+    Close { client_session: String, subshell_id: String, delete: bool, complete: std::sync::mpsc::SyncSender<anyhow::Result<()>> },
 }
 
 pub type InterruptHandler = Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>;
@@ -106,12 +106,9 @@ impl ExecutionInterrupt {
 pub struct ExecutionContext {
     events: mpsc::Sender<ContextMessage>,
     interrupt: ExecutionInterrupt,
-    unlock: Option<Arc<Unlock>>,
     subshells: Option<Arc<SubshellAccess>>,
     parent: Arc<Value>,
 }
-
-struct Unlock { sent: AtomicBool, execution_id: String, events: mpsc::UnboundedSender<String> }
 
 struct SubshellAccess { client_session: String, commands: mpsc::UnboundedSender<SessionCommand> }
 
@@ -119,14 +116,12 @@ impl ExecutionContext {
     pub(crate) fn new(
         events: mpsc::Sender<ContextMessage>,
         interrupt: ExecutionInterrupt,
-        unlock: Option<(String, mpsc::UnboundedSender<String>)>,
         subshells: Option<(String, mpsc::UnboundedSender<SessionCommand>)>,
         parent: Value,
     ) -> Self {
         Self {
             events,
             interrupt,
-            unlock: unlock.map(|(execution_id, events)| Arc::new(Unlock { sent: AtomicBool::new(false), execution_id, events })),
             subshells: subshells.map(|(client_session, commands)| Arc::new(SubshellAccess { client_session, commands })),
             parent: Arc::new(parent),
         }
@@ -152,23 +147,17 @@ impl ExecutionContext {
         result.recv()?
     }
 
-    pub fn unlock(&self) -> bool {
-        let Some(unlock) = &self.unlock else { return false };
-        if unlock.sent.swap(true, Ordering::AcqRel) { return false; }
-        unlock.events.send(unlock.execution_id.clone()).is_ok()
-    }
-
-    pub fn open_subshell(&self) -> anyhow::Result<String> {
+    pub fn open_subshell(&self, subshell_id: Option<String>) -> anyhow::Result<String> {
         let access = self.subshells.as_ref().ok_or_else(|| anyhow::anyhow!("subshells are not available"))?;
         let (complete, result) = std::sync::mpsc::sync_channel(1);
-        access.commands.send(SessionCommand::Open { client_session: access.client_session.clone(), complete })?;
+        access.commands.send(SessionCommand::Open { client_session: access.client_session.clone(), subshell_id, complete })?;
         result.recv()?
     }
 
-    pub fn close_subshell(&self, subshell_id: String) -> anyhow::Result<()> {
+    pub fn close_subshell(&self, subshell_id: String, delete: bool) -> anyhow::Result<()> {
         let access = self.subshells.as_ref().ok_or_else(|| anyhow::anyhow!("subshells are not available"))?;
         let (complete, result) = std::sync::mpsc::sync_channel(1);
-        access.commands.send(SessionCommand::Close { client_session: access.client_session.clone(), subshell_id, complete })?;
+        access.commands.send(SessionCommand::Close { client_session: access.client_session.clone(), subshell_id, delete, complete })?;
         result.recv()?
     }
 

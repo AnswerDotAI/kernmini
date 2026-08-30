@@ -1,6 +1,6 @@
 import asyncio, contextvars
 from contextlib import nullcontext
-from .concur import _release, _subshell, subshell, unlock
+from .concur import _subshell, sidecar, subshell
 
 _current = contextvars.ContextVar("kernmini.execution", default=None)
 
@@ -13,8 +13,8 @@ class _IOPub:
 
 class NativeKernel:
     def __init__(self, target): self.target,self.iopub = target,_IOPub()
-    def unlock(self): return unlock()
     def subshell(self): return subshell()
+    def sidecar(self): return sidecar()
     def current_parent(self):
         sink = _current.get()
         return sink.parent() if sink is not None else {}
@@ -29,7 +29,6 @@ def kernel_proxy(target): return NativeKernel(target)
 async def execute(target, current, sink, code, **kwargs):
     "Run one Python execution with its task-local routing and capture context."
     token = current.set(sink)
-    release_token = _release.set(sink.unlock)
     subshell_token = _subshell.set(sink)
     sink.started(asyncio.current_task())
     try:
@@ -38,7 +37,6 @@ async def execute(target, current, sink, code, **kwargs):
         with context: return await target.execute(code, **kwargs)
     finally:
         _subshell.reset(subshell_token)
-        _release.reset(release_token)
         current.reset(token)
 
 

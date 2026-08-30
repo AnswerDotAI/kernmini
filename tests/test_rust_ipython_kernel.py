@@ -85,27 +85,29 @@ def test_ipython_story(rust_ipython_kernel):
     result, = (m for m in msgs if m["msg_type"] == "execute_result")
     assert result["content"]["data"]["text/plain"] == "42"
 
-    created = _request(control, sess, "create_subshell_request", {}, timeout=30)
-    child = created["content"]["subshell_id"]
-    assert _request(control, sess, "list_subshell_request", {})["content"]["subshell_id"] == [child]
+    child = "sidecar"
     child_id = _send(shell, sess, "execute_request", dict(code="x + 1"), subshell_id=child)
     (reply_id, child_reply), = _replies(shell, sess, 1)
     assert reply_id == child_id and child_reply["status"] == "ok" and child_reply["execution_count"] == 1
     msgs = _drain_iopub(sub)
     result, = (m for m in msgs if m["msg_type"] == "execute_result")
     assert result["content"]["data"]["text/plain"] == "42" and result["parent_header"]["subshell_id"] == child
+    assert _request(control, sess, "list_subshell_request", {})["content"]["subshell_id"] == [child]
+    created = _request(control, sess, "create_subshell_request", dict(subshell_id=child), timeout=30)
+    again = _request(control, sess, "create_subshell_request", dict(subshell_id=child), timeout=30)
+    assert created["content"] == again["content"] == dict(status="ok", subshell_id=child)
     assert _request(control, sess, "delete_subshell_request", dict(subshell_id=child))["content"]["status"] == "ok"
     assert _request(control, sess, "list_subshell_request", {})["content"]["subshell_id"] == []
 
-    caller = _send(shell, sess, "execute_request", dict(code="import asyncio\nfrom ipymini import subshell\nloop = asyncio.get_running_loop()\ngate2 = asyncio.Event()\nwith subshell():\n    print('subshell ready', flush=True)\n    await asyncio.wait_for(gate2.wait(), 5)"))
-    _wait_stream(sub, "subshell ready")
+    caller = _send(shell, sess, "execute_request", dict(code="import asyncio\nfrom ipymini import sidecar\nloop = asyncio.get_running_loop()\ngate2 = asyncio.Event()\nwith sidecar():\n    print('sidecar ready', flush=True)\n    await asyncio.wait_for(gate2.wait(), 5)"))
+    _wait_stream(sub, "sidecar ready")
     routed = _send(shell, sess, "execute_request", dict(code="loop.call_soon_threadsafe(gate2.set)"))
     replies = dict(_replies(shell, sess, 2))
     assert replies[caller]["status"] == replies[routed]["status"] == "ok"
     assert replies[routed]["execution_count"] == 1
     _drain_iopub(sub)
     _drain_iopub(sub)
-    assert _request(control, sess, "list_subshell_request", {})["content"]["subshell_id"] == []
+    assert _request(control, sess, "list_subshell_request", {})["content"]["subshell_id"] == ["sidecar"]
 
     input_id = _send(shell, sess, "execute_request", dict(code="print(input('Name: '))", allow_stdin=True))
     assert stdin.poll(10_000), "no input_request"
@@ -144,14 +146,6 @@ def test_ipython_story(rust_ipython_kernel):
     assert result["content"]["data"]["text/plain"] == "42"
     background, = (m for m in msgs if m["msg_type"] == "stream" and m["content"]["text"] == "background\n")
     assert background["parent_header"]["msg_id"] == task_id
-
-    waiter = _send(shell, sess, "execute_request", dict(code="from ipymini import unlock\ngate = asyncio.Event()\nassert unlock()\nprint('unlocked', flush=True)\nawait asyncio.wait_for(gate.wait(), 5)"))
-    _wait_stream(sub, "unlocked")
-    setter = _send(shell, sess, "execute_request", dict(code="gate.set()"))
-    replies = dict(_replies(shell, sess, 2))
-    assert replies[waiter]["status"] == replies[setter]["status"] == "ok"
-    _drain_iopub(sub)
-    _drain_iopub(sub)
 
     sleeper = _send(shell, sess, "execute_request", dict(code="print('sleeping', flush=True)\nawait asyncio.sleep(.3)"))
     _wait_stream(sub, "sleeping")

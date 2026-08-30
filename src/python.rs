@@ -68,16 +68,16 @@ impl ExecutionSink {
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))
     }
 
-    fn unlock(&self) -> bool { self.context.unlock() }
-
-    fn open_subshell(&self, py: Python<'_>) -> PyResult<String> {
+    #[pyo3(signature = (subshell_id=None))]
+    fn open_subshell(&self, py: Python<'_>, subshell_id: Option<String>) -> PyResult<String> {
         let context = self.context.clone();
-        py.detach(|| context.open_subshell()).map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        py.detach(|| context.open_subshell(subshell_id)).map_err(|error| PyRuntimeError::new_err(error.to_string()))
     }
 
-    fn close_subshell(&self, py: Python<'_>, subshell_id: String) -> PyResult<()> {
+    #[pyo3(signature = (subshell_id, delete=true))]
+    fn close_subshell(&self, py: Python<'_>, subshell_id: String, delete: bool) -> PyResult<()> {
         let context = self.context.clone();
-        py.detach(|| context.close_subshell(subshell_id)).map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        py.detach(|| context.close_subshell(subshell_id, delete)).map_err(|error| PyRuntimeError::new_err(error.to_string()))
     }
 
     fn parent(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { json_to_py(py, &self.context.parent()) }
@@ -438,7 +438,11 @@ impl LanguageSession for PyLanguageSession {
 #[pyfunction]
 #[pyo3(signature = (connection_file, factory, loop_factory, own_process_group=false))]
 fn run_kernel<'py>(
-    py: Python<'py>, connection_file: String, factory: Py<PyAny>, loop_factory: Py<PyAny>, own_process_group: bool,
+    py: Python<'py>,
+    connection_file: String,
+    factory: Py<PyAny>,
+    loop_factory: Py<PyAny>,
+    own_process_group: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     #[cfg(unix)]
     let owns_process_group = own_process_group

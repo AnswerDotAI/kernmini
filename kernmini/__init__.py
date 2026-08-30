@@ -2,7 +2,7 @@
 
 import asyncio
 
-from .concur import unlock, subshell
+from .concur import sidecar, subshell
 from .kernelspec import install_kernelspec, install_kernelspec_dir
 
 

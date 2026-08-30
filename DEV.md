@@ -22,9 +22,9 @@ The language boundary has two levels:
 - `Language` supplies the parent `LanguageSession` and creates independent child sessions.
 - `LanguageSession` supplies kernel metadata, execution, completion, inspection, completeness, history, comms, debugging, and shutdown.
 
-Each shell session is driven by one scheduler object which owns its queue, active executions, hold, lock, and interruption state. Shared transport and language handles live in its services object. Output from executions and comm handlers uses the same event pump, so stream, display, buffer, flush, and parent-routing behavior cannot diverge between the two paths.
+Each shell session is driven by one scheduler object which owns its queue, active execution, hold, and interruption state. Shared transport and language handles live in its services object. Output from executions and comm handlers uses the same event pump, so stream, display, buffer, flush, and parent-routing behavior cannot diverge between the two paths.
 
-An execute receives an `ExecutionContext`. It emits streams and displays, requests stdin, publishes arbitrary messages, observes or registers for interruption, releases the execution queue with `unlock()`, and opens temporary subshell routes. The engine converts these events into correctly parented Jupyter messages.
+An execute receives an `ExecutionContext`. It emits streams and displays, requests stdin, publishes arbitrary messages, observes or registers for interruption, and opens subshell routes. The engine converts these events into correctly parented Jupyter messages.
 
 `run_kernel` installs Tokio SIGINT handling. `run_kernel_with_interrupter` lets an embedding host supply its own `KernelInterrupter`.
 
@@ -69,7 +69,7 @@ Two execute metadata extensions are supported:
 
 `KERNMINI_HOLD_TIMEOUT` is the hold backstop in seconds and defaults to 3600.
 
-Python code can call `kernmini.unlock()` to release its queue baton while the current cell continues, or use `kernmini.subshell()` to route later requests from that client session through a temporary child.
+An explicit `subshell_id` on a shell request creates that named subshell when missing, then routes the request there. `create_subshell_request` also accepts an optional `subshell_id`; a supplied ID makes explicit creation idempotent. Python code can use `kernmini.subshell()` to route later requests from its client session through a temporary child, or `kernmini.sidecar()` to route through the persistent named `sidecar` subshell.
 
 ## Output and stdin
 
