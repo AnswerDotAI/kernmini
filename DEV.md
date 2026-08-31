@@ -77,8 +77,7 @@ An explicit `subshell_id` on a shell request creates that named subshell when mi
 
 `ExecutionContext` is the single output boundary. The Rust engine associates every stream, display, buffer, stdin request, and arbitrary published message with its execution before sending it over IOPub or stdin. The PyO3 adapter keeps the current context in a ContextVar so Python callbacks and IPython comm handlers reach the correct sink.
 
-`KERNMINI_IOPUB_QMAX` controls the bounded Rust IOPub queue and defaults to 10000.
-Environment configuration is read once when the kernel starts and shared by its parent and child sessions.
+`KERNMINI_IOPUB_QMAX` controls the bounded Rust IOPub queue and defaults to 10000. Environment configuration is read once when the kernel starts and shared by its parent and child sessions.
 
 ## Lifecycle
 
@@ -94,10 +93,7 @@ The Python wrapper may place a standalone kernel in its own process group. On sh
 - a pure Rust echo language, implemented entirely in the example binary, through the crate API;
 - an IPython shell through the Python adapter.
 
-`ConKernelClient` launches each kernel and manages its Jupyter requests, replies, IOPub messages, stdin, and shutdown. Tests use live protocol events to
-synchronize concurrent behavior rather than sleeps or hand-written socket draining. Standalone Rust tests cover wire framing and language interruption
-primitives. A Python integration test drives a real debugpy session through the DAP transport directly, since that transport is the subject of the test.
-ipymini's complete protocol and behavior suite is kernmini's main integration test.
+`ConKernelClient` launches each kernel and manages its Jupyter requests, replies, IOPub messages, stdin, and shutdown. Tests use live protocol events to synchronize concurrent behavior rather than sleeps or hand-written socket draining. Standalone Rust tests cover wire framing and language interruption primitives. A Python integration test drives a real debugpy session through the DAP transport directly, since that transport is the subject of the test. ipymini's complete protocol and behavior suite is kernmini's main integration test.
 
 ```bash
 cd ../ipymini
