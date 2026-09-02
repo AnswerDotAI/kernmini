@@ -70,6 +70,12 @@ async def test_ipython_story():
         background = await qs.jmsg_for('stream', pred=lambda m: parent_id(m) == task_id, queue='iopub', timeout=5)
         assert background['content']['text'] == 'background\n'
 
+        bail = "async def bail(): raise SystemExit('bail')\nres = await asyncio.gather(bail(), return_exceptions=True)\ntype(res[0]).__name__"
+        for kw in ({}, dict(subshell_id='sidecar')):
+            msgs = await _run(kc, bail, **kw)
+            assert _one(msgs, 'execute_reply')['content']['status'] == 'ok'
+            assert _one(msgs, 'execute_result')['content']['data']['text/plain'] == "'SystemExit'"
+
         sleeper = kc.run("print('sleeping', flush=True)\nawait asyncio.sleep(.3)", timeout=5)
         sleeper_msgs = await _until_stream(sleeper, 'sleeping\n')
         complete = await kc.cmd.complete(code='x.rea', cursor_pos=5, timeout=5)

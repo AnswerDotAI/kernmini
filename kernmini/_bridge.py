@@ -5,6 +5,14 @@ from .concur import _subshell, sidecar, subshell
 _current = contextvars.ContextVar("kernmini.execution", default=None)
 
 
+def run_loop(loop, fut=None):
+    "Run `loop` until `fut` is done (forever if None), re-entering after a `SystemExit` escapes a task, which asyncio raises out of the loop"
+    while True:
+        try: return loop.run_until_complete(fut) if fut is not None else loop.run_forever()
+        except SystemExit:
+            if fut is not None and fut.done(): raise
+
+
 class _IOPub:
     def send(self, msg_type, parent=None, content=None, metadata=None, ident=None, buffers=None, **kwargs):
         sink = _current.get()
