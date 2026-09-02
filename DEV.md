@@ -58,6 +58,8 @@ The adapter uses optional capabilities when present:
 
 The parent shell runs on a persistent asyncio loop in the Python main thread. Child shells run on supervised OS threads with their own persistent loops created by the same factory. Kernmini's multi-thread Tokio runtime independently drives transport, queues, output, control, and interrupt futures, so synchronous Python cannot block the engine.
 
+A `SystemExit` raised inside a task leaves the loop rather than the task, so `kernmini._bridge.run_loop` drives every loop and re-enters it: user code cannot end the kernel.
+
 `pyo3-async-runtimes` bridges Python awaitables onto their owning loop. Interrupts cancel async cells through that loop and inject `KeyboardInterrupt` into synchronous Python. A child blocked indefinitely in arbitrary C code cannot be interrupted safely; kernmini does not pretend otherwise.
 
 ## Execution and concurrency

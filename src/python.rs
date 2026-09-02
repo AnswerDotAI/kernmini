@@ -294,7 +294,7 @@ impl Language for PyLanguage {
                 let session = PyLanguageSession::with_locals(py, target, locals, Some(thread_loop.clone()))?;
                 if created.take().unwrap().send(Ok(session)).is_err() { return Ok(()); }
                 drop(thread_loop);
-                event_loop.call_method0(py, "run_forever")?;
+                py.import("kernmini._bridge")?.call_method1("run_loop", (&event_loop,))?;
                 Ok(())
             });
             if let Err(error) = outcome
