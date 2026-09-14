@@ -67,6 +67,8 @@ impl Session {
         }
     }
 
+    pub fn id(&self) -> &str { &self.session }
+
     fn signature(&self, json_parts: &[Bytes]) -> Vec<u8> {
         if self.key.is_empty() { return vec![]; }
         let mut mac = HmacSha256::new_from_slice(&self.key).expect("HMAC accepts arbitrary key sizes");

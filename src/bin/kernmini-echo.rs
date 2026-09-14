@@ -1,4 +1,4 @@
-use kernmini::{ExecuteOutcome, ExecuteRequest, ExecutionContext, KernelInfo, Language, LanguageError, LanguageSession};
+use kernmini::{ExecuteOutcome, ExecuteRequest, ExecutionContext, KernelInfo, Language, LanguageError, LanguageEvent, LanguageSession};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,7 +21,7 @@ impl LanguageSession for EchoSession {
 
     async fn execute(&self, request: ExecuteRequest, context: ExecutionContext) -> anyhow::Result<ExecuteOutcome> {
         let execution_count = self.execution_count.fetch_add(1, Ordering::AcqRel) + 1;
-        context.stream("stdout", format!("echo: {}\n", request.code));
+        context.emit(LanguageEvent::Stream { name: "stdout".into(), text: format!("echo: {}\n", request.code) }).await?;
         if let Some(seconds) = request.code.strip_prefix("sleep:") { tokio::time::sleep(std::time::Duration::from_secs_f64(seconds.parse()?)).await; }
         let error = (request.code == "boom").then(|| LanguageError { ename: "EchoError".into(), evalue: request.code.clone(), traceback: vec![] });
         Ok(ExecuteOutcome {

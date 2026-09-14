@@ -110,10 +110,8 @@ impl Iopub {
     pub async fn publish(&self, message: Message) -> anyhow::Result<()> {
         let frames = self.session.encode(&message)?;
         let mut peers = self.peers.lock().await;
-        peers.retain(|peer| match peer.try_send(frames.clone()) {
-            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
-        });
+        let mut i = 0;
+        while i < peers.len() { if peers[i].send(frames.clone()).await.is_err() { peers.swap_remove(i); } else { i += 1; } }
         Ok(())
     }
 

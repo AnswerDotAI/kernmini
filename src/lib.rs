@@ -14,6 +14,6 @@ pub use dap::{DapClient, DapRequest};
 pub use engine::{KernelInterrupter, run_kernel, run_kernel_with_interrupter};
 pub use language::{
     CompleteRequest, DebugEventSender, ExecuteOutcome, ExecuteRequest, ExecutionContext, ExecutionInterrupt, InspectRequest, InterruptHandler, KernelInfo,
-    Language, LanguageError, LanguageMessage, LanguageSession,
+    Language, LanguageError, LanguageEvent, LanguageMessage, LanguageSession,
 };
 pub use wire::{Message, Session, WireError};

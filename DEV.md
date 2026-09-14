@@ -77,9 +77,11 @@ An explicit `subshell_id` on a shell request creates that named subshell when mi
 
 ## Output and stdin
 
-`ExecutionContext` is the single output boundary. The Rust engine associates every stream, display, buffer, stdin request, and arbitrary published message with its execution before sending it over IOPub or stdin. The PyO3 adapter keeps the current context in a ContextVar so Python callbacks and IPython comm handlers reach the correct sink.
+`ExecutionContext` is the single output boundary. Native async producers call `emit(LanguageEvent).await`; producers on synchronous execution threads call `emit_blocking(LanguageEvent)`. Both return an error if the output channel has closed. The Python callbacks release the GIL while sending. The Rust engine associates every stream, display, buffer, stdin request, and arbitrary published message with its execution before sending it over IOPub or stdin. The PyO3 adapter keeps the current context in a ContextVar so Python callbacks and IPython comm handlers reach the correct sink.
 
-`KERNMINI_IOPUB_QMAX` controls the bounded Rust IOPub queue and defaults to 10000. Environment configuration is read once when the kernel starts and shared by its parent and child sessions.
+`KERNMINI_IOPUB_QMAX` bounds each execution's event queue and each IOPub peer's outgoing queue, in messages, and defaults to 10000. Full queues wait for space instead of dropping events; a slow direct IOPub subscriber can slow execution. This is not an output-byte limit. Environment configuration is read once when the kernel starts and shared by its parent and child sessions.
+
+The existing output pump drains at most one queue capacity per batch and joins adjacent same-name stream events with `String::push_str`. It never waits to fill a batch or merges across stream-name changes, displays, input, or flush markers. Flush preserves event order through publication; it does not acknowledge subscriber receipt.
 
 ## Lifecycle
 

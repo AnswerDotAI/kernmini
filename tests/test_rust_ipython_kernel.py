@@ -1,5 +1,7 @@
 "The real ipymini language adapter hosted directly by kernmini and driven by ConKernelClient."
 
+import os
+
 import pytest
 from conkernelclient import JmsgQueues, run_kernel
 from jupywire.ops import parent_id
@@ -8,6 +10,29 @@ from test_kernel_echo import ROOT, _one, _pubs, _run, _until_stream
 
 
 IPYTHON_ARGV = [__import__('sys').executable, str(ROOT/'tests'/'ipython_kernel.py'), '{connection_file}']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('capacity', [1, 64])
+async def test_output_backpressure(capacity):
+    env = os.environ | dict(KERNMINI_IOPUB_QMAX=str(capacity))
+    async with run_kernel('rust-ipython', IPYTHON_ARGV, env=env) as (_, kc):
+        msgs = await _run(kc, """import sys
+from IPython.display import display, clear_output
+for i in range(1000): print(i)
+display('boundary')
+print('err', file=sys.stderr)
+clear_output(wait=True)
+print('tail')""")
+        pubs = _pubs(msgs)
+        split = next(i for i,m in enumerate(pubs) if m['msg_type'] == 'display_data')
+        text = ''.join(m['content']['text'] for m in pubs[:split] if m['msg_type'] == 'stream')
+        assert text == ''.join(f'{i}\n' for i in range(1000))
+        assert [m['msg_type'] for m in pubs[split:]] == ['display_data', 'stream', 'clear_output', 'stream', 'status']
+        assert pubs[split+1]['content'] == dict(name='stderr', text='err\n')
+        assert pubs[split+2]['content'] == dict(wait=True)
+        assert pubs[split+3]['content'] == dict(name='stdout', text='tail\n')
+        assert _one(msgs, 'execute_reply')['content']['status'] == 'ok'
 
 
 @pytest.mark.asyncio

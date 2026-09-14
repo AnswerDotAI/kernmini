@@ -1,6 +1,6 @@
 use crate::{
     CompleteRequest, DebugEventSender, ExecuteOutcome, ExecuteRequest, ExecutionContext, InspectRequest, KernelInfo, KernelInterrupter, Language,
-    LanguageError, LanguageMessage, LanguageSession,
+    LanguageError, LanguageEvent, LanguageMessage, LanguageSession,
 };
 use async_trait::async_trait;
 use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError};
@@ -92,11 +92,19 @@ impl ExecutionSink {
         buffers: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let identity = if identity.is_none() { None } else { Some(identity.cast::<PyBytes>()?.as_bytes().to_vec()) };
-        self.context.publish(msg_type, py_to_json(py, content)?, py_to_json(py, metadata)?, identity, py_buffers(buffers)?);
-        Ok(())
+        let event = LanguageEvent::Message {
+            msg_type,
+            content: py_to_json(py, content)?,
+            metadata: py_to_json(py, metadata)?,
+            identity,
+            buffers: py_buffers(buffers)?,
+        };
+        py.detach(|| self.context.emit_blocking(event)).map_err(|error| PyRuntimeError::new_err(error.to_string()))
     }
 
-    fn stream(&self, name: String, text: String) { self.context.stream(name, text); }
+    fn stream(&self, py: Python<'_>, name: String, text: String) -> PyResult<()> {
+        py.detach(|| self.context.emit_blocking(LanguageEvent::Stream { name, text })).map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
 
     fn display(&self, py: Python<'_>, event: &Bound<'_, PyAny>) -> PyResult<()> {
         let event = event.cast::<PyDict>()?;
@@ -104,8 +112,8 @@ impl ExecutionSink {
         let buffers = buffer_value.as_ref().map(|value| py_buffers(value.as_any())).transpose()?.unwrap_or_default();
         let clean = event.copy()?;
         if buffer_value.is_some() { clean.del_item("buffers")? }
-        self.context.display_buffers(py_to_json(py, clean.as_any())?, buffers);
-        Ok(())
+        let event = LanguageEvent::Display { event: py_to_json(py, clean.as_any())?, buffers };
+        py.detach(|| self.context.emit_blocking(event)).map_err(|error| PyRuntimeError::new_err(error.to_string()))
     }
 
     fn input(&self, py: Python<'_>, prompt: String, password: bool) -> PyResult<String> {
@@ -366,9 +374,18 @@ impl LanguageSession for PyLanguageSession {
         let value = Python::attach(|py| -> PyResult<Value> { py_to_json(py, result?.bind(py)) }).map_err(|error| anyhow::anyhow!(error.to_string()))?;
 
         if let Some(streams) = value.get("streams").and_then(Value::as_array) {
-            for stream in streams { context.stream(stream["name"].as_str().unwrap_or("stdout"), stream["text"].as_str().unwrap_or("")); }
+            for stream in streams {
+                context
+                    .emit(LanguageEvent::Stream {
+                        name: stream["name"].as_str().unwrap_or("stdout").into(),
+                        text: stream["text"].as_str().unwrap_or("").into(),
+                    })
+                    .await?;
+            }
         }
-        if let Some(displays) = value.get("display").and_then(Value::as_array) { for display in displays { context.display(display.clone()) } }
+        if let Some(displays) = value.get("display").and_then(Value::as_array) {
+            for display in displays { context.emit(LanguageEvent::Display { event: display.clone(), buffers: vec![] }).await?; }
+        }
         let mut error = value.get("error").filter(|error| !error.is_null()).map(|error| LanguageError {
             ename: error["ename"].as_str().unwrap_or("Error").to_owned(),
             evalue: error["evalue"].as_str().unwrap_or("").to_owned(),

@@ -133,17 +133,27 @@ impl<L: LanguageSession> ShellServices<L> {
         let request = request.clone();
         let stdin = identity.map(|identity| (self.stdin.clone(), identity));
         tokio::spawn(async move {
-            while let Some(message) = output.recv().await {
-                match message {
-                    ContextMessage::Event(event) => {
-                        let _ = publish_event(&iopub, &session, &request, event, silent).await;
+            let mut batch = vec![];
+            let capacity = output.max_capacity();
+            while output.recv_many(&mut batch, capacity).await != 0 {
+                let mut messages = batch.drain(..).peekable();
+                while let Some(mut message) = messages.next() {
+                    if let ContextMessage::Event(LanguageEvent::Stream { name, text }) = &mut message {
+                        while matches!(messages.peek(), Some(ContextMessage::Event(LanguageEvent::Stream { name: next, .. })) if next == name) {
+                            if let Some(ContextMessage::Event(LanguageEvent::Stream { text: next, .. })) = messages.next() { text.push_str(&next); }
+                        }
                     }
-                    ContextMessage::Flush(complete) => {
-                        let _ = complete.send(());
-                    }
-                    ContextMessage::Input { prompt, password, complete } => {
-                        let result = if let Some((stdin, identity)) = &stdin { stdin.request(identity, &request, prompt, password).await } else { Err(anyhow::anyhow!("input is unavailable outside execution")) };
-                        let _ = complete.send(result);
+                    match message {
+                        ContextMessage::Event(event) => {
+                            let _ = publish_event(&iopub, &session, &request, event, silent).await;
+                        }
+                        ContextMessage::Flush(complete) => {
+                            let _ = complete.send(());
+                        }
+                        ContextMessage::Input { prompt, password, complete } => {
+                            let result = if let Some((stdin, identity)) = &stdin { stdin.request(identity, &request, prompt, password).await } else { Err(anyhow::anyhow!("input is unavailable outside execution")) };
+                            let _ = complete.send(result);
+                        }
                     }
                 }
             }

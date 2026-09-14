@@ -127,18 +127,14 @@ impl ExecutionContext {
         }
     }
 
-    pub fn stream(&self, name: impl Into<String>, text: impl Into<String>) {
-        let _ = self.events.try_send(ContextMessage::Event(LanguageEvent::Stream { name: name.into(), text: text.into() }));
+    pub async fn emit(&self, event: LanguageEvent) -> anyhow::Result<()> {
+        self.events.send(ContextMessage::Event(event)).await?;
+        Ok(())
     }
 
-    pub fn display(&self, event: Value) { self.display_buffers(event, vec![]); }
-
-    pub fn display_buffers(&self, event: Value, buffers: Vec<Vec<u8>>) {
-        let _ = self.events.try_send(ContextMessage::Event(LanguageEvent::Display { event, buffers }));
-    }
-
-    pub fn publish(&self, msg_type: String, content: Value, metadata: Value, identity: Option<Vec<u8>>, buffers: Vec<Vec<u8>>) {
-        let _ = self.events.try_send(ContextMessage::Event(LanguageEvent::Message { msg_type, content, metadata, identity, buffers }));
+    pub fn emit_blocking(&self, event: LanguageEvent) -> anyhow::Result<()> {
+        self.events.blocking_send(ContextMessage::Event(event))?;
+        Ok(())
     }
 
     pub fn input(&self, prompt: impl Into<String>, password: bool) -> anyhow::Result<String> {
