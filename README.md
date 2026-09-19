@@ -37,6 +37,8 @@ run_kernel(sys.argv[-1], EchoShell, own_process_group=True)
 
 Rust language implementations use the `Language` and `LanguageSession` traits directly. `ExecutionContext` provides stream, display, stdin, interrupt, and subshell routing without exposing Jupyter transport details.
 
+`ThreadWorker` lets async adapters call a synchronous interpreter on a dedicated thread. Its factory creates the interpreter there, `call` awaits a closure's result, and `shutdown` waits for destruction on the same thread. The interpreter need not be `Send`; the adapter supplies a thread builder for its name and stack size. Language traits stay async.
+
 Output queues are bounded and apply backpressure rather than silently dropping messages. The output pump batches adjacent same-stream writes without a timer. A slow direct IOPub subscriber can slow execution.
 
 `DapClient` is the optional language-neutral debugger transport: framed TCP, request correlation, timeouts, asynchronous events, and shutdown. Language adapters retain debugger startup, request policy, source mapping, and variable semantics.

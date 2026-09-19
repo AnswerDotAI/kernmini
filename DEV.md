@@ -17,6 +17,8 @@ pytest -q
 
 The engine owns connection loading, ZMTP transport, HMAC-signed Jupyter messages, duplicate-signature rejection, shell/control routing, IOPub, stdin, heartbeat, execution scheduling, interruption, subshells, and shutdown.
 
+Synchronous interpreters can use `ThreadWorker` without another language trait. It owns only thread startup, closure dispatch, replies and shutdown; language adapters retain interruption, execution counts and all language semantics. Rustygate's Luau adapter and miniapl use it.
+
 Router and heartbeat peers are independent connection tasks. Ordinary peer EOF removes any router registration and ends silently; genuine I/O, handshake, and protocol failures are reported on kernel stderr.
 
 The language boundary has two levels:

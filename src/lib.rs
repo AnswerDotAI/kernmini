@@ -6,6 +6,7 @@ mod language;
 mod python;
 #[cfg(feature = "python")]
 mod python_dap;
+mod thread_worker;
 mod transport;
 mod wire;
 
@@ -16,4 +17,5 @@ pub use language::{
     CompleteRequest, DebugEventSender, ExecuteOutcome, ExecuteRequest, ExecutionContext, ExecutionInterrupt, InspectRequest, InterruptHandler, KernelInfo,
     Language, LanguageError, LanguageEvent, LanguageMessage, LanguageSession,
 };
+pub use thread_worker::ThreadWorker;
 pub use wire::{Message, Session, WireError};
