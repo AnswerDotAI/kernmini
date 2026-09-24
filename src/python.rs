@@ -503,6 +503,32 @@ fn run_kernel<'py>(
     })
 }
 
+/// Write a kernel.json for `argv` (which must include '{connection_file}') and install it; returns the destination.
+#[pyfunction]
+#[pyo3(signature = (name, argv, display_name, language, user=true, prefix=None, **spec_kw))]
+#[allow(clippy::too_many_arguments)]
+fn install_kernelspec(
+    py: Python<'_>,
+    name: &str,
+    argv: Vec<String>,
+    display_name: &str,
+    language: &str,
+    user: bool,
+    prefix: Option<std::path::PathBuf>,
+    spec_kw: Option<&Bound<'_, PyDict>>,
+) -> PyResult<std::path::PathBuf> {
+    let _ = user; // Kept for compatibility: installs go under `prefix`, or else to the user data directory.
+    let extra = match spec_kw.map(|kw| py_to_json(py, kw.as_any())).transpose()? { Some(Value::Object(map)) => map, _ => serde_json::Map::new() };
+    crate::install_kernelspec(name, &argv, display_name, language, extra, prefix.as_deref()).map_err(|error| PyRuntimeError::new_err(format!("{error:#}")))
+}
+
+/// Copy an existing kernelspec directory (kernel.json plus any assets) into place; returns the destination.
+#[pyfunction]
+#[pyo3(signature = (src_dir, name, user=true, prefix=None))]
+fn install_kernelspec_dir(src_dir: std::path::PathBuf, name: &str, user: bool, prefix: Option<std::path::PathBuf>) -> PyResult<std::path::PathBuf> {
+    let _ = user; // Kept for compatibility: installs go under `prefix`, or else to the user data directory.
+    crate::install_kernelspec_dir(&src_dir, name, prefix.as_deref()).map_err(|error| PyRuntimeError::new_err(format!("{error:#}")))
+}
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     let mut runtime = tokio::runtime::Builder::new_multi_thread();
@@ -510,6 +536,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     pyo3_async_runtimes::tokio::init(runtime);
     crate::python_dap::register(module)?;
     module.add_function(wrap_pyfunction!(run_kernel, module)?)?;
+    module.add_function(wrap_pyfunction!(install_kernelspec, module)?)?;
+    module.add_function(wrap_pyfunction!(install_kernelspec_dir, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

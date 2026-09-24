@@ -34,6 +34,8 @@ An execute receives an `ExecutionContext`. It emits streams and displays, reques
 
 `DapClient` is independent of the kernel engine and reusable by any language adapter. It owns DAP's `Content-Length` TCP framing, sequence allocation, pending responses, timeouts, asynchronous events, and connection teardown. The language adapter owns debugger startup and language-specific request handling.
 
+`install_kernelspec` writes a `kernel.json`. `install_kernelspec_dir` copies a kernelspec directory. Both replace any kernelspec of the same name in `share/jupyter/kernels` under a prefix, or else in the user Jupyter data directory. `JUPYTER_DATA_DIR` overrides the user directory. The Python functions of the same names wrap them. Their `user` parameter is accepted and ignored.
+
 ## Python adapter
 
 The public Python `kernmini.run_kernel(connection_file, shell_factory)` is synchronous. It uses loopmini when available, falls back to the standard asyncio loop, and accepts an explicit `loop_factory`. `_native.run_kernel` is the underlying awaitable used by the wrapper.
