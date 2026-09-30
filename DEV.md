@@ -26,6 +26,18 @@ The language boundary has two levels:
 - `Language` supplies the parent `LanguageSession` and creates independent child sessions.
 - `LanguageSession` supplies kernel metadata, execution, completion, inspection, completeness, history, comms, debugging, and shutdown.
 
+### Errors
+
+Public operations and language traits return `kernmini::Result<T>`. Its `Error` has an inspectable `kind()`, a diagnostic, and a standard `source()` chain. `context(...)` adds a diagnostic without changing the kind; `caused_by(...)` retains an underlying error. Errors are cloneable so one connection failure can complete several pending requests without losing its cause.
+
+The kinds are `Interrupted`, `Closed`, `TimedOut`, `Unavailable`, `InvalidInput`, `Io`, `Protocol`, and `Adapter`. They describe the failure, not a universal recovery policy: a lost client and a stopped interpreter both close a resource but require different actions. A timeout does not imply that a remote operation was never performed. Use `Error::adapter(error)` for a foreign language implementation's operational failure; non-Send interpreter errors must become owned diagnostics before crossing a thread boundary.
+
+An executed program's exception is still a `LanguageError` inside `Ok(ExecuteOutcome)`, not an operational `Err`. `WireError` remains the detailed Jupyter codec error and is retained as the cause of higher-level protocol errors. Failed DAP responses remain response values, not transport errors.
+
+The Python boundary maps interruption to `KeyboardInterrupt`, timeouts to `TimeoutError`, invalid input to `ValueError`, and I/O failures to `OSError` (with the OS error number when available). Other operational errors raise `kernmini.KernelError`, a `RuntimeError` subclass. Converted exceptions carry a `kind` attribute with the Rust kind's name, such as `Closed` or `Protocol`; underlying Python exceptions are retained as causes.
+
+Ordinary adapter request failures produce an error reply and idle rather than silently ending the shell. A closed language service is fatal and reaches the kernel runner. Listener, shell-task, interrupt-handler, and output-pump failures also reach their owner. A client's failed reply connection does not terminate the kernel. Output submission still means enqueueing, not subscriber acknowledgement.
+
 Each shell session is driven by one scheduler object which owns its queue, active execution, hold, and interruption state. Shared transport and language handles live in its services object. Output from executions and comm handlers uses the same event pump, so stream, display, buffer, flush, and parent-routing behavior cannot diverge between the two paths.
 
 An execute receives an `ExecutionContext`. It emits streams and displays, requests stdin, publishes arbitrary messages, observes or registers for interruption, and opens subshell routes. The engine converts these events into correctly parented Jupyter messages.
@@ -86,6 +98,8 @@ An explicit `subshell_id` on a shell request creates that named subshell when mi
 `KERNMINI_IOPUB_QMAX` bounds each execution's event queue and each IOPub peer's outgoing queue, in messages, and defaults to 10000. Full queues wait for space instead of dropping events; a slow direct IOPub subscriber can slow execution. This is not an output-byte limit. Environment configuration is read once when the kernel starts and shared by its parent and child sessions.
 
 The existing output pump drains at most one queue capacity per batch and joins adjacent same-name stream events with `String::push_str`. It never waits to fill a batch or merges across stream-name changes, displays, input, or flush markers. Flush preserves event order through publication; it does not acknowledge subscriber receipt.
+
+`input()` returns `Interrupted` when its execution is cancelled, including during shutdown. Cancellation is recorded before waking input, and applies while waiting for the stdin peer, sending the prompt, or awaiting its reply. A lost stdin peer instead returns `Closed`; an empty reply is a successful empty string. Input forbidden by `allow_stdin` or requested outside execution returns `Unavailable`. These errors do not depend on the timing of a separate language interrupt handler. A gateway's frontend disconnect is not necessarily a kernel-peer disconnect; that policy remains with the gateway.
 
 ## Lifecycle
 

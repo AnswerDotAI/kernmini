@@ -29,7 +29,9 @@ impl std::fmt::Display for WireError {
     }
 }
 
-impl std::error::Error for WireError {}
+impl std::error::Error for WireError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { match self { Self::Json(error) => Some(error), _ => None } }
+}
 
 impl From<serde_json::Error> for WireError { fn from(error: serde_json::Error) -> Self { Self::Json(error) } }
 

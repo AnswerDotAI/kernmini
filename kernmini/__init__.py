@@ -23,7 +23,7 @@ def run_kernel(connection_file, shell_factory, *, loop_factory=None, own_process
 
 
 def __getattr__(name):
-    if name in ("__version__", "install_kernelspec", "install_kernelspec_dir"):
+    if name in ("__version__", "install_kernelspec", "install_kernelspec_dir", "KernelError"):
         from . import _native
         return getattr(_native, name)
     raise AttributeError(name)

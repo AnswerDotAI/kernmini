@@ -1,8 +1,9 @@
 use async_trait::async_trait;
+use crate::{Error, ErrorKind};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 #[derive(Clone, Debug)]
 pub struct KernelInfo {
@@ -55,25 +56,26 @@ pub enum LanguageEvent {
 pub(crate) enum ContextMessage {
     Event(LanguageEvent),
     Flush(oneshot::Sender<()>),
-    Input { prompt: String, password: bool, complete: std::sync::mpsc::SyncSender<anyhow::Result<String>> },
+    Input { prompt: String, password: bool, complete: std::sync::mpsc::SyncSender<crate::Result<String>> },
 }
 
 pub(crate) enum SessionCommand {
-    Open { client_session: String, subshell_id: Option<String>, complete: std::sync::mpsc::SyncSender<anyhow::Result<String>> },
-    Close { client_session: String, subshell_id: String, delete: bool, complete: std::sync::mpsc::SyncSender<anyhow::Result<()>> },
+    Open { client_session: String, subshell_id: Option<String>, complete: std::sync::mpsc::SyncSender<crate::Result<String>> },
+    Close { client_session: String, subshell_id: String, delete: bool, complete: std::sync::mpsc::SyncSender<crate::Result<()>> },
 }
 
-pub type InterruptHandler = Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>;
+pub type InterruptHandler = Arc<dyn Fn() -> crate::Result<()> + Send + Sync>;
 
 #[derive(Clone, Default)]
-pub struct ExecutionInterrupt { requested: Arc<AtomicBool>, handler: Arc<Mutex<InterruptRegistration>> }
+pub struct ExecutionInterrupt { requested: Arc<AtomicBool>, handler: Arc<Mutex<InterruptRegistration>>, changed: Arc<Notify> }
 
 #[derive(Default)]
 struct InterruptRegistration { handler: Option<InterruptHandler>, delivered: bool }
 
 impl ExecutionInterrupt {
-    pub fn request(&self) -> anyhow::Result<bool> {
+    pub fn request(&self) -> crate::Result<bool> {
         let first = !self.requested.swap(true, Ordering::AcqRel);
+        self.changed.notify_waiters();
         let handler = {
             let mut registration = self.handler.lock().expect("execution interrupt lock poisoned");
             if registration.delivered { None } else if let Some(handler) = registration.handler.clone() {
@@ -87,10 +89,17 @@ impl ExecutionInterrupt {
 
     pub fn requested(&self) -> bool { self.requested.load(Ordering::Acquire) }
 
-    pub fn set_handler(&self, handler: InterruptHandler) -> anyhow::Result<()> {
+    pub(crate) async fn cancelled(&self) {
+        let notified = self.changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.requested() { notified.await }
+    }
+
+    pub fn set_handler(&self, handler: InterruptHandler) -> crate::Result<()> {
         let deliver = {
             let mut registration = self.handler.lock().expect("execution interrupt lock poisoned");
-            if registration.handler.is_some() { anyhow::bail!("execution interrupt handler already registered") }
+            if registration.handler.is_some() { return Err(Error::new(ErrorKind::InvalidInput, "execution interrupt handler already registered")); }
             registration.handler = Some(handler.clone());
             if self.requested() && !registration.delivered {
                 registration.delivered = true;
@@ -108,6 +117,7 @@ pub struct ExecutionContext {
     interrupt: ExecutionInterrupt,
     subshells: Option<Arc<SubshellAccess>>,
     parent: Arc<Value>,
+    allow_stdin: bool,
 }
 
 struct SubshellAccess { client_session: String, commands: mpsc::UnboundedSender<SessionCommand> }
@@ -118,40 +128,44 @@ impl ExecutionContext {
         interrupt: ExecutionInterrupt,
         subshells: Option<(String, mpsc::UnboundedSender<SessionCommand>)>,
         parent: Value,
+        allow_stdin: bool,
     ) -> Self {
         Self {
             events,
             interrupt,
             subshells: subshells.map(|(client_session, commands)| Arc::new(SubshellAccess { client_session, commands })),
             parent: Arc::new(parent),
+            allow_stdin,
         }
     }
 
-    pub async fn emit(&self, event: LanguageEvent) -> anyhow::Result<()> {
+    pub async fn emit(&self, event: LanguageEvent) -> crate::Result<()> {
         self.events.send(ContextMessage::Event(event)).await?;
         Ok(())
     }
 
-    pub fn emit_blocking(&self, event: LanguageEvent) -> anyhow::Result<()> {
+    pub fn emit_blocking(&self, event: LanguageEvent) -> crate::Result<()> {
         self.events.blocking_send(ContextMessage::Event(event))?;
         Ok(())
     }
 
-    pub fn input(&self, prompt: impl Into<String>, password: bool) -> anyhow::Result<String> {
+    pub fn input(&self, prompt: impl Into<String>, password: bool) -> crate::Result<String> {
+        if !self.allow_stdin { return Err(Error::new(ErrorKind::Unavailable, "input is unavailable in this execution")); }
+        if self.interrupted() { return Err(Error::interrupted()); }
         let (complete, result) = std::sync::mpsc::sync_channel(1);
         self.events.blocking_send(ContextMessage::Input { prompt: prompt.into(), password, complete })?;
         result.recv()?
     }
 
-    pub fn open_subshell(&self, subshell_id: Option<String>) -> anyhow::Result<String> {
-        let access = self.subshells.as_ref().ok_or_else(|| anyhow::anyhow!("subshells are not available"))?;
+    pub fn open_subshell(&self, subshell_id: Option<String>) -> crate::Result<String> {
+        let access = self.subshells.as_ref().ok_or_else(|| Error::new(ErrorKind::Unavailable, "subshells are not available"))?;
         let (complete, result) = std::sync::mpsc::sync_channel(1);
         access.commands.send(SessionCommand::Open { client_session: access.client_session.clone(), subshell_id, complete })?;
         result.recv()?
     }
 
-    pub fn close_subshell(&self, subshell_id: String, delete: bool) -> anyhow::Result<()> {
-        let access = self.subshells.as_ref().ok_or_else(|| anyhow::anyhow!("subshells are not available"))?;
+    pub fn close_subshell(&self, subshell_id: String, delete: bool) -> crate::Result<()> {
+        let access = self.subshells.as_ref().ok_or_else(|| Error::new(ErrorKind::Unavailable, "subshells are not available"))?;
         let (complete, result) = std::sync::mpsc::sync_channel(1);
         access.commands.send(SessionCommand::Close { client_session: access.client_session.clone(), subshell_id, delete, complete })?;
         result.recv()?
@@ -161,33 +175,34 @@ impl ExecutionContext {
 
     pub fn interrupted(&self) -> bool { self.interrupt.requested() }
 
-    pub fn set_interrupt_handler(&self, handler: InterruptHandler) -> anyhow::Result<()> { self.interrupt.set_handler(handler) }
+    pub fn set_interrupt_handler(&self, handler: InterruptHandler) -> crate::Result<()> { self.interrupt.set_handler(handler) }
 
-    pub(crate) async fn flush(&self) {
+    pub(crate) async fn flush(&self) -> crate::Result<()> {
         let (send, receive) = oneshot::channel();
-        if self.events.send(ContextMessage::Flush(send)).await.is_ok() { let _ = receive.await; }
+        self.events.send(ContextMessage::Flush(send)).await?;
+        Ok(receive.await?)
     }
 }
 
 #[async_trait]
 pub trait LanguageSession: Clone + Send + Sync + 'static {
-    fn kernel_info(&self) -> anyhow::Result<KernelInfo>;
+    fn kernel_info(&self) -> crate::Result<KernelInfo>;
     fn supports_debugger(&self) -> bool { false }
-    fn set_debug_sender(&self, _sender: DebugEventSender) -> anyhow::Result<()> { Ok(()) }
+    fn set_debug_sender(&self, _sender: DebugEventSender) -> crate::Result<()> { Ok(()) }
     fn execution_count(&self) -> u64 { 0 }
-    async fn execute(&self, request: ExecuteRequest, context: ExecutionContext) -> anyhow::Result<ExecuteOutcome>;
-    async fn complete(&self, request: CompleteRequest) -> anyhow::Result<Value> {
+    async fn execute(&self, request: ExecuteRequest, context: ExecutionContext) -> crate::Result<ExecuteOutcome>;
+    async fn complete(&self, request: CompleteRequest) -> crate::Result<Value> {
         Ok(json!({"status": "ok", "matches": [], "cursor_start": request.cursor_pos, "cursor_end": request.cursor_pos, "metadata": {}}))
     }
-    async fn inspect(&self, _request: InspectRequest) -> anyhow::Result<Value> { Ok(json!({"status": "ok", "found": false, "data": {}, "metadata": {}})) }
-    async fn is_complete(&self, _code: String) -> anyhow::Result<Value> { Ok(json!({"status": "unknown"})) }
-    async fn history(&self, _request: Value) -> anyhow::Result<Value> { Ok(json!({"status": "ok", "history": []})) }
-    async fn comm_info(&self, _request: Value) -> anyhow::Result<Value> { Ok(json!({"status": "ok", "comms": {}})) }
-    async fn debug(&self, _request: Value) -> anyhow::Result<Value> {
+    async fn inspect(&self, _request: InspectRequest) -> crate::Result<Value> { Ok(json!({"status": "ok", "found": false, "data": {}, "metadata": {}})) }
+    async fn is_complete(&self, _code: String) -> crate::Result<Value> { Ok(json!({"status": "unknown"})) }
+    async fn history(&self, _request: Value) -> crate::Result<Value> { Ok(json!({"status": "ok", "history": []})) }
+    async fn comm_info(&self, _request: Value) -> crate::Result<Value> { Ok(json!({"status": "ok", "comms": {}})) }
+    async fn debug(&self, _request: Value) -> crate::Result<Value> {
         Ok(json!({"response": {"success": false, "message": "debugger not supported"}, "events": []}))
     }
-    async fn message(&self, _message: LanguageMessage, _context: ExecutionContext) -> anyhow::Result<()> { Ok(()) }
-    async fn shutdown(&self) -> anyhow::Result<()> { Ok(()) }
+    async fn message(&self, _message: LanguageMessage, _context: ExecutionContext) -> crate::Result<()> { Ok(()) }
+    async fn shutdown(&self) -> crate::Result<()> { Ok(()) }
 }
 
 #[async_trait]
@@ -195,5 +210,5 @@ pub trait Language: Send + Sync + 'static {
     type Session: LanguageSession;
     fn parent(&self) -> Self::Session;
     fn supports_children(&self) -> bool { false }
-    async fn create_child(&self) -> anyhow::Result<Self::Session>;
+    async fn create_child(&self) -> crate::Result<Self::Session>;
 }

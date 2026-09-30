@@ -9,7 +9,7 @@ pub struct ThreadWorker<T> { jobs: mpsc::Sender<Job<T>> }
 impl<T> Clone for ThreadWorker<T> { fn clone(&self) -> Self { Self { jobs: self.jobs.clone() } } }
 
 impl<T: 'static> ThreadWorker<T> {
-    pub async fn start(builder: std::thread::Builder, create: impl FnOnce() -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<Self> {
+    pub async fn start(builder: std::thread::Builder, create: impl FnOnce() -> crate::Result<T> + Send + 'static) -> crate::Result<Self> {
         let (jobs, receive) = mpsc::channel();
         let (ready, initialized) = oneshot::channel();
         builder.spawn(move || {
@@ -34,22 +34,22 @@ impl<T: 'static> ThreadWorker<T> {
                 }
             }
         })?;
-        initialized.await??;
+        initialized.await.map_err(|error| crate::Error::closed("interpreter worker during startup").caused_by(error))??;
         Ok(Self { jobs })
     }
 
-    pub async fn call<R: Send + 'static>(&self, call: impl FnOnce(&mut T) -> R + Send + 'static) -> anyhow::Result<R> {
+    pub async fn call<R: Send + 'static>(&self, call: impl FnOnce(&mut T) -> R + Send + 'static) -> crate::Result<R> {
         let (reply, result) = oneshot::channel();
         self.send(Job::Call(Box::new(move |state| { let _ = reply.send(call(state)); })))?;
-        Ok(result.await?)
+        result.await.map_err(|error| crate::Error::closed("interpreter worker").caused_by(error))
     }
 
     /// Wait until the interpreter has been dropped. Dropping all handles also stops the worker.
-    pub async fn shutdown(&self) -> anyhow::Result<()> {
+    pub async fn shutdown(&self) -> crate::Result<()> {
         let (reply, result) = oneshot::channel();
         self.send(Job::Stop(reply))?;
-        Ok(result.await?)
+        result.await.map_err(|error| crate::Error::closed("interpreter worker during shutdown").caused_by(error))
     }
 
-    fn send(&self, job: Job<T>) -> anyhow::Result<()> { self.jobs.send(job).map_err(|_| anyhow::anyhow!("interpreter worker stopped")) }
+    fn send(&self, job: Job<T>) -> crate::Result<()> { self.jobs.send(job).map_err(|_| crate::Error::closed("interpreter worker")) }
 }

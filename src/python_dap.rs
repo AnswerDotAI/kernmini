@@ -1,6 +1,6 @@
 use crate::python::{json_to_py, py_to_json};
-use crate::{DapClient, DapRequest};
-use pyo3::exceptions::PyRuntimeError;
+use crate::{DapClient, DapRequest, Error};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyModule};
 use std::future::Future;
@@ -9,13 +9,12 @@ use std::time::Duration;
 
 fn runtime_block_on<F, T>(py: Python<'_>, future: F) -> PyResult<T>
 where
-    F: Future<Output = anyhow::Result<T>> + Send,
+    F: Future<Output = crate::Result<T>> + Send,
     T: Send,
-{ py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(future)).map_err(|error| PyRuntimeError::new_err(error.to_string())) }
+{ py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(future)).map_err(PyErr::from) }
 
 fn timeout_duration(seconds: f64) -> PyResult<Duration> {
-    if !seconds.is_finite() || seconds < 0.0 { return Err(PyRuntimeError::new_err("DAP timeout must be a non-negative finite number")); }
-    Ok(Duration::from_secs_f64(seconds))
+    Duration::try_from_secs_f64(seconds).map_err(|error| PyValueError::new_err(format!("invalid DAP timeout: {error}")))
 }
 
 #[pyclass(name = "DapRequest")]
@@ -24,7 +23,7 @@ struct PyDapRequest { request: Mutex<Option<DapRequest>> }
 impl PyDapRequest {
     fn wait(&self, py: Python<'_>, timeout: f64) -> PyResult<Py<PyAny>> {
         let request =
-            self.request.lock().expect("DAP request lock poisoned").take().ok_or_else(|| PyRuntimeError::new_err("DAP request was already awaited"))?;
+            self.request.lock().expect("DAP request lock poisoned").take().ok_or_else(|| PyValueError::new_err("DAP request was already awaited"))?;
         let result = runtime_block_on(py, request.wait(timeout_duration(timeout)?))?;
         json_to_py(py, &result)
     }
@@ -35,7 +34,7 @@ struct PyDapClient { client: Mutex<Option<DapClient>>, event_callback: Option<Py
 
 impl PyDapClient {
     fn client(&self) -> PyResult<DapClient> {
-        self.client.lock().expect("DAP client lock poisoned").clone().ok_or_else(|| PyRuntimeError::new_err("DAP client is not connected"))
+        self.client.lock().expect("DAP client lock poisoned").clone().ok_or_else(|| Error::closed("DAP client (not connected)").into())
     }
 }
 
@@ -77,7 +76,7 @@ impl PyDapClient {
     #[pyo3(signature = (req_seq, waiter, timeout=10.0))]
     fn wait_for_response(&self, py: Python<'_>, req_seq: u64, waiter: PyRef<'_, PyDapRequest>, timeout: f64) -> PyResult<Py<PyAny>> {
         let sequence = waiter.request.lock().expect("DAP request lock poisoned").as_ref().map(DapRequest::sequence);
-        if sequence != Some(req_seq) { return Err(PyRuntimeError::new_err("DAP request sequence does not match waiter")); }
+        if sequence != Some(req_seq) { return Err(PyValueError::new_err("DAP request sequence does not match waiter")); }
         waiter.wait(py, timeout)
     }
 }

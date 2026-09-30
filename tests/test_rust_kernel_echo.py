@@ -28,3 +28,9 @@ async def test_rust_language_story():
         failed_reply, aborted_reply = await asyncio.gather(failed, aborted)
         assert [failed_reply['content']['status'], aborted_reply['content']['status']] == ['error', 'aborted']
         assert order == [failed_id, aborted_id]
+
+        # An operational adapter failure still replies and becomes idle; it is not an EchoError or a lost shell task.
+        messages = [m async for m in kc.run('adapter-error', timeout=5)]
+        assert next(m for m in messages if m['msg_type']=='execute_reply')['content']['ename'] == 'KernelError'
+        assert messages[-1]['content']['execution_state'] == 'idle'
+        assert (await kc.reply('still here', timeout=5))['content']['status'] == 'ok'

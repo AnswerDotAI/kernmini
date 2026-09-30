@@ -1,9 +1,9 @@
 use crate::{
     CompleteRequest, DebugEventSender, ExecuteOutcome, ExecuteRequest, ExecutionContext, InspectRequest, KernelInfo, KernelInterrupter, Language,
-    LanguageError, LanguageEvent, LanguageMessage, LanguageSession,
+    LanguageError, LanguageEvent, LanguageMessage, LanguageSession, Error, ErrorKind,
 };
 use async_trait::async_trait;
-use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError};
+use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PyTimeoutError, PyValueError, PyOSError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList};
 use serde_json::{Value, json};
@@ -11,11 +11,41 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+pyo3::create_exception!(_native, KernelError, PyRuntimeError);
+
+impl From<Error> for PyErr {
+    fn from(error: Error) -> Self {
+        use std::error::Error as _;
+        let mut source = error.source();
+        let mut errno = None;
+        while let Some(cause) = source {
+            if let Some(io) = cause.downcast_ref::<std::io::Error>() { errno = io.raw_os_error(); }
+            source = cause.source();
+        }
+        let exception = match error.kind() {
+            ErrorKind::Interrupted => PyKeyboardInterrupt::new_err(error.to_string()),
+            ErrorKind::TimedOut => PyTimeoutError::new_err(error.to_string()),
+            ErrorKind::InvalidInput => PyValueError::new_err(error.to_string()),
+            ErrorKind::Io => match errno { Some(errno) => PyOSError::new_err((errno, error.to_string())), None => PyOSError::new_err(error.to_string()) },
+            _ => KernelError::new_err(error.to_string()),
+        };
+        Python::attach(|py| {
+            let _ = exception.value(py).setattr("kind", format!("{:?}", error.kind()));
+            let mut source = error.source();
+            while let Some(cause) = source {
+                if let Some(cause) = cause.downcast_ref::<PyErr>() { exception.set_cause(py, Some(cause.clone_ref(py))); break; }
+                source = cause.source();
+            }
+        });
+        exception
+    }
+}
+
 pub(crate) fn py_to_json(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Value> {
     let kwargs = PyDict::new(py);
     kwargs.set_item("default", py.import("fastcore.nbio")?.getattr("jupyter_json_default")?)?;
     let text: String = py.import("json")?.call_method("dumps", (value,), Some(&kwargs))?.extract()?;
-    serde_json::from_str(&text).map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    serde_json::from_str(&text).map_err(|error| PyErr::from(Error::from(error)))
 }
 
 pub(crate) fn json_to_py(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> { Ok(py.import("json")?.call_method1("loads", (value.to_string(),))?.unbind()) }
@@ -63,21 +93,21 @@ impl ExecutionSink {
                     interrupted.store(true, AtomicOrdering::Release);
                     Ok(())
                 })
-                .map_err(|error| anyhow::anyhow!(error.to_string()))
+                .map_err(Error::adapter)
             }))
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+            .map_err(PyErr::from)
     }
 
     #[pyo3(signature = (subshell_id=None))]
     fn open_subshell(&self, py: Python<'_>, subshell_id: Option<String>) -> PyResult<String> {
         let context = self.context.clone();
-        py.detach(|| context.open_subshell(subshell_id)).map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        py.detach(|| context.open_subshell(subshell_id)).map_err(PyErr::from)
     }
 
     #[pyo3(signature = (subshell_id, delete=true))]
     fn close_subshell(&self, py: Python<'_>, subshell_id: String, delete: bool) -> PyResult<()> {
         let context = self.context.clone();
-        py.detach(|| context.close_subshell(subshell_id, delete)).map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        py.detach(|| context.close_subshell(subshell_id, delete)).map_err(PyErr::from)
     }
 
     fn parent(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { json_to_py(py, &self.context.parent()) }
@@ -99,11 +129,11 @@ impl ExecutionSink {
             identity,
             buffers: py_buffers(buffers)?,
         };
-        py.detach(|| self.context.emit_blocking(event)).map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        py.detach(|| self.context.emit_blocking(event)).map_err(PyErr::from)
     }
 
     fn stream(&self, py: Python<'_>, name: String, text: String) -> PyResult<()> {
-        py.detach(|| self.context.emit_blocking(LanguageEvent::Stream { name, text })).map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        py.detach(|| self.context.emit_blocking(LanguageEvent::Stream { name, text })).map_err(PyErr::from)
     }
 
     fn display(&self, py: Python<'_>, event: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -113,14 +143,12 @@ impl ExecutionSink {
         let clean = event.copy()?;
         if buffer_value.is_some() { clean.del_item("buffers")? }
         let event = LanguageEvent::Display { event: py_to_json(py, clean.as_any())?, buffers };
-        py.detach(|| self.context.emit_blocking(event)).map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        py.detach(|| self.context.emit_blocking(event)).map_err(PyErr::from)
     }
 
     fn input(&self, py: Python<'_>, prompt: String, password: bool) -> PyResult<String> {
         let context = self.context.clone();
-        py.detach(|| context.input(prompt, password)).map_err(|error| {
-            if error.to_string() == "KeyboardInterrupt" { PyKeyboardInterrupt::new_err("") } else { PyRuntimeError::new_err(error.to_string()) }
-        })
+        py.detach(|| context.input(prompt, password)).map_err(PyErr::from)
     }
 }
 
@@ -169,7 +197,7 @@ struct InputRouter { current: Py<PyAny> }
 impl InputRouter {
     fn __call__(&self, py: Python<'_>, prompt: String, password: bool) -> PyResult<String> {
         let sink = self.current.call_method0(py, "get")?;
-        if sink.is_none(py) { return Err(PyRuntimeError::new_err("input requested outside an execution")); }
+        if sink.is_none(py) { return Err(Error::new(ErrorKind::Unavailable, "input requested outside an execution").into()); }
         sink.call_method1(py, "input", (prompt, password))?.extract(py)
     }
 }
@@ -195,12 +223,12 @@ impl ChildLoop {
         Python::attach(|py| { if let Ok(stop) = event_loop.getattr(py, "stop") { let _ = event_loop.call_method1(py, "call_soon_threadsafe", (stop,)); } });
     }
 
-    async fn shutdown(&self) -> anyhow::Result<()> {
+    async fn shutdown(&self) -> crate::Result<()> {
         self.stop();
         let thread = self.thread.lock().expect("child thread lock poisoned").take();
         if let Some(thread) = thread {
             let joined = tokio::task::spawn_blocking(move || thread.join().is_ok()).await?;
-            if !joined { anyhow::bail!("child Python session panicked during shutdown") }
+            if !joined { return Err(Error::closed("child Python session during shutdown")); }
         }
         Ok(())
     }
@@ -260,7 +288,7 @@ impl PyLanguageSession {
         Ok(Self { target, current, locals, _child_loop: child_loop })
     }
 
-    async fn request(&self, method: &str, content: Value) -> anyhow::Result<Value> {
+    async fn request(&self, method: &str, content: Value) -> crate::Result<Value> {
         let target = Python::attach(|py| self.target.clone_ref(py));
         let locals = self.locals.clone();
         let future = Python::attach(|py| -> PyResult<_> {
@@ -268,9 +296,9 @@ impl PyLanguageSession {
             let awaitable = bridge.call_method1("request_async", (target, method, json_to_py(py, &content)?))?;
             pyo3_async_runtimes::into_future_with_locals(&locals, awaitable)
         })
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let result = future.await.map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        Python::attach(|py| py_to_json(py, result.bind(py))).map_err(|error| anyhow::anyhow!(error.to_string()))
+        .map_err(Error::adapter)?;
+        let result = future.await.map_err(Error::adapter)?;
+        Python::attach(|py| py_to_json(py, result.bind(py))).map_err(Error::adapter)
     }
 }
 
@@ -284,7 +312,7 @@ impl Language for PyLanguage {
 
     fn supports_children(&self) -> bool { true }
 
-    async fn create_child(&self) -> anyhow::Result<Self::Session> {
+    async fn create_child(&self) -> crate::Result<Self::Session> {
         let factory = Python::attach(|py| self.factory.clone_ref(py));
         let loop_factory = Python::attach(|py| self.loop_factory.clone_ref(py));
         let child_loop = Arc::new(ChildLoop::new());
@@ -307,16 +335,16 @@ impl Language for PyLanguage {
             });
             if let Err(error) = outcome
                 && let Some(created) = created.take()
-            { let _ = created.send(Err(error.to_string())); }
+            { let _ = created.send(Err(Error::adapter(error))); }
         });
         *child_loop.thread.lock().expect("child thread lock poisoned") = Some(thread);
-        result.await.map_err(|_| anyhow::anyhow!("child Python session ended during startup"))?.map_err(anyhow::Error::msg)
+        result.await.map_err(|error| Error::closed("child Python session during startup").caused_by(error))?
     }
 }
 
 #[async_trait]
 impl LanguageSession for PyLanguageSession {
-    fn kernel_info(&self) -> anyhow::Result<KernelInfo> {
+    fn kernel_info(&self) -> crate::Result<KernelInfo> {
         Python::attach(|py| -> PyResult<KernelInfo> {
             let value = py_to_json(py, self.target.call_method0(py, "kernel_info")?.bind(py))?;
             Ok(KernelInfo {
@@ -326,24 +354,24 @@ impl LanguageSession for PyLanguageSession {
                 language_info: value.get("language_info").cloned().unwrap_or_else(|| json!({})),
             })
         })
-        .map_err(|error| anyhow::anyhow!(error.to_string()))
+        .map_err(Error::adapter)
     }
 
     fn execution_count(&self) -> u64 { Python::attach(|py| self.target.getattr(py, "execution_count").and_then(|value| value.extract(py))).unwrap_or(0) }
 
     fn supports_debugger(&self) -> bool { Python::attach(|py| self.target.bind(py).hasattr("debug_request")).unwrap_or(false) }
 
-    fn set_debug_sender(&self, sender: DebugEventSender) -> anyhow::Result<()> {
+    fn set_debug_sender(&self, sender: DebugEventSender) -> crate::Result<()> {
         Python::attach(|py| -> PyResult<()> {
             if self.target.bind(py).hasattr("debugger")? {
                 self.target.getattr(py, "debugger")?.setattr(py, "event_callback", Py::new(py, DebugRouter { sender })?)?;
             }
             Ok(())
         })
-        .map_err(|error| anyhow::anyhow!(error.to_string()))
+        .map_err(Error::adapter)
     }
 
-    async fn execute(&self, request: ExecuteRequest, context: ExecutionContext) -> anyhow::Result<ExecuteOutcome> {
+    async fn execute(&self, request: ExecuteRequest, context: ExecutionContext) -> crate::Result<ExecuteOutcome> {
         let target = Python::attach(|py| self.target.clone_ref(py));
         let current = Python::attach(|py| self.current.clone_ref(py));
         let locals = self.locals.clone();
@@ -368,10 +396,10 @@ impl LanguageSession for PyLanguageSession {
             let awaitable = bridge.call_method("execute", (target, current, sink, request.code), Some(&kwargs))?;
             pyo3_async_runtimes::into_future_with_locals(&locals, awaitable)
         })
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        .map_err(Error::adapter)?;
 
         let result = future.await;
-        let value = Python::attach(|py| -> PyResult<Value> { py_to_json(py, result?.bind(py)) }).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let value = Python::attach(|py| -> PyResult<Value> { py_to_json(py, result?.bind(py)) }).map_err(Error::adapter)?;
 
         if let Some(streams) = value.get("streams").and_then(Value::as_array) {
             for stream in streams {
@@ -404,21 +432,21 @@ impl LanguageSession for PyLanguageSession {
         })
     }
 
-    async fn complete(&self, request: CompleteRequest) -> anyhow::Result<Value> {
+    async fn complete(&self, request: CompleteRequest) -> crate::Result<Value> {
         self.request("complete", json!({"code": request.code, "cursor_pos": request.cursor_pos})).await
     }
 
-    async fn inspect(&self, request: InspectRequest) -> anyhow::Result<Value> {
+    async fn inspect(&self, request: InspectRequest) -> crate::Result<Value> {
         self.request("inspect", json!({"code": request.code, "cursor_pos": request.cursor_pos, "detail_level": request.detail_level})).await
     }
 
-    async fn is_complete(&self, code: String) -> anyhow::Result<Value> { self.request("is_complete", json!({"code": code})).await }
+    async fn is_complete(&self, code: String) -> crate::Result<Value> { self.request("is_complete", json!({"code": code})).await }
 
-    async fn history(&self, request: Value) -> anyhow::Result<Value> { self.request("history", request).await }
+    async fn history(&self, request: Value) -> crate::Result<Value> { self.request("history", request).await }
 
-    async fn comm_info(&self, request: Value) -> anyhow::Result<Value> { self.request("comm_info", request).await }
+    async fn comm_info(&self, request: Value) -> crate::Result<Value> { self.request("comm_info", request).await }
 
-    async fn debug(&self, request: Value) -> anyhow::Result<Value> {
+    async fn debug(&self, request: Value) -> crate::Result<Value> {
         let target = Python::attach(|py| self.target.clone_ref(py));
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| -> PyResult<Value> {
@@ -427,10 +455,10 @@ impl LanguageSession for PyLanguageSession {
             })
         })
         .await?
-        .map_err(|error| anyhow::anyhow!(error.to_string()))
+        .map_err(Error::adapter)
     }
 
-    async fn message(&self, message: LanguageMessage, context: ExecutionContext) -> anyhow::Result<()> {
+    async fn message(&self, message: LanguageMessage, context: ExecutionContext) -> crate::Result<()> {
         let target = Python::attach(|py| self.target.clone_ref(py));
         let current = Python::attach(|py| self.current.clone_ref(py));
         let locals = self.locals.clone();
@@ -441,12 +469,12 @@ impl LanguageSession for PyLanguageSession {
             let awaitable = bridge.call_method1("message", (target, current, sink, message.msg_type, json_to_py(py, &message.content)?, buffers))?;
             pyo3_async_runtimes::into_future_with_locals(&locals, awaitable)
         })
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        future.await.map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        .map_err(Error::adapter)?;
+        future.await.map_err(Error::adapter)?;
         Ok(())
     }
 
-    async fn shutdown(&self) -> anyhow::Result<()> {
+    async fn shutdown(&self) -> crate::Result<()> {
         if let Some(child_loop) = &self._child_loop { child_loop.shutdown().await? }
         Ok(())
     }
@@ -494,11 +522,12 @@ fn run_kernel<'py>(
         let result = crate::run_kernel_with_interrupter(connection_file, language, interrupt).await;
         #[cfg(unix)]
         if owns_process_group {
+            if let Err(error) = &result { eprintln!("kernel failed: {error}"); }
             unsafe { libc::killpg(libc::getpid(), libc::SIGTERM); }
             tokio::time::sleep(std::time::Duration::from_millis(60)).await;
             unsafe { libc::killpg(libc::getpid(), libc::SIGKILL); }
         }
-        result.map_err(|error| PyRuntimeError::new_err(format!("{error:#}")))?;
+        result.map_err(PyErr::from)?;
         Ok(())
     })
 }
@@ -519,7 +548,7 @@ fn install_kernelspec(
 ) -> PyResult<std::path::PathBuf> {
     let _ = user; // Kept for compatibility: installs go under `prefix`, or else to the user data directory.
     let extra = match spec_kw.map(|kw| py_to_json(py, kw.as_any())).transpose()? { Some(Value::Object(map)) => map, _ => serde_json::Map::new() };
-    crate::install_kernelspec(name, &argv, display_name, language, extra, prefix.as_deref()).map_err(|error| PyRuntimeError::new_err(format!("{error:#}")))
+    crate::install_kernelspec(name, &argv, display_name, language, extra, prefix.as_deref()).map_err(PyErr::from)
 }
 
 /// Copy an existing kernelspec directory (kernel.json plus any assets) into place; returns the destination.
@@ -527,7 +556,7 @@ fn install_kernelspec(
 #[pyo3(signature = (src_dir, name, user=true, prefix=None))]
 fn install_kernelspec_dir(src_dir: std::path::PathBuf, name: &str, user: bool, prefix: Option<std::path::PathBuf>) -> PyResult<std::path::PathBuf> {
     let _ = user; // Kept for compatibility: installs go under `prefix`, or else to the user data directory.
-    crate::install_kernelspec_dir(&src_dir, name, prefix.as_deref()).map_err(|error| PyRuntimeError::new_err(format!("{error:#}")))
+    crate::install_kernelspec_dir(&src_dir, name, prefix.as_deref()).map_err(PyErr::from)
 }
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -535,6 +564,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     runtime.enable_all().worker_threads(2);
     pyo3_async_runtimes::tokio::init(runtime);
     crate::python_dap::register(module)?;
+    module.add("KernelError", module.py().get_type::<KernelError>())?;
     module.add_function(wrap_pyfunction!(run_kernel, module)?)?;
     module.add_function(wrap_pyfunction!(install_kernelspec, module)?)?;
     module.add_function(wrap_pyfunction!(install_kernelspec_dir, module)?)?;

@@ -37,6 +37,8 @@ run_kernel(sys.argv[-1], EchoShell, own_process_group=True)
 
 Rust language implementations use the `Language` and `LanguageSession` traits directly. `ExecutionContext` provides stream, display, stdin, interrupt, and subshell routing without exposing Jupyter transport details.
 
+Operations return `kernmini::Result<T>` with a typed `ErrorKind` and preserved causes. These operational failures are separate from an executed program's `LanguageError`. See [the error contract](DEV.md#errors) for cancellation, closure, timeout, and Python exception mappings.
+
 `ThreadWorker` lets async adapters call a synchronous interpreter on a dedicated thread. Its factory creates the interpreter there, `call` awaits a closure's result, and `shutdown` waits for destruction on the same thread. The interpreter need not be `Send`; the adapter supplies a thread builder for its name and stack size. Language traits stay async.
 
 Output queues are bounded and apply backpressure rather than silently dropping messages. The output pump batches adjacent same-stream writes without a timer. A slow direct IOPub subscriber can slow execution.

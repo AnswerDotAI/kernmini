@@ -5,6 +5,7 @@ import queue, socket, subprocess, sys, time
 import pytest
 
 from kernmini._native import DapClient
+from kernmini import KernelError
 
 
 def _port():
@@ -39,7 +40,7 @@ def debugpy_client():
         try:
             client.connect("127.0.0.1", port)
             break
-        except RuntimeError:
+        except OSError:
             if adapter.poll() is not None: raise RuntimeError(f"debugpy adapter exited with {adapter.returncode}")
             if time.monotonic() >= deadline: raise TimeoutError("debugpy adapter did not start")
             time.sleep(.02)
@@ -79,3 +80,29 @@ def test_debugpy_session(debugpy_client, tmp_path):
 
     _request(client, "continue", threadId=thread_id)
     _event(events, "terminated")
+
+
+def test_dap_failures():
+    "A real TCP peer that withholds replies, then sends malformed DAP, exercises the exception contract."
+    client = DapClient()
+    with socket.socket() as listener:
+        listener.bind(('127.0.0.1', 0))
+        listener.listen()
+        client.connect(*listener.getsockname())
+        peer, _ = listener.accept()
+        with peer:
+            with pytest.raises(ValueError): client.send_request([])
+            with pytest.raises(TimeoutError): client.send_request(dict(command='withheld'), timeout=.01)
+            seq, waiting = client.send_request_async(dict(command='malformed'))
+            peer.sendall(b'Content-Length: 1\r\n\r\nx')
+            with pytest.raises(KernelError) as failed: client.wait_for_response(seq, waiting, timeout=2)
+            assert failed.value.kind == 'Protocol'
+            with pytest.raises(KernelError) as failed: client.send_request(dict(command='failed'))
+            assert failed.value.kind == 'Protocol'
+    client.close()
+    with pytest.raises(KernelError) as failed: client.send_request(dict(command='closed'))
+    assert failed.value.kind == 'Closed'
+
+    client = DapClient()
+    with pytest.raises(KernelError) as failed: client.send_request(dict(command='unconnected'))
+    assert failed.value.kind == 'Closed'

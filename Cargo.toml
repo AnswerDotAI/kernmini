@@ -11,7 +11,6 @@ include = ["/src/**", "/LICENSE", "/README.md"]
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-anyhow = "1"
 async-trait = "0.1"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

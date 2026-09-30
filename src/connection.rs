@@ -16,11 +16,17 @@ pub struct ConnectionInfo {
 }
 
 impl ConnectionInfo {
-    pub fn read(path: impl AsRef<Path>) -> anyhow::Result<Self> { Ok(serde_json::from_slice(&std::fs::read(path)?)?) }
+    pub fn read(path: impl AsRef<Path>) -> crate::Result<Self> {
+        let path = path.as_ref();
+        let bytes = std::fs::read(path).map_err(|error| crate::Error::from(error).context(format!("reading {}", path.display())))?;
+        serde_json::from_slice(&bytes).map_err(|error| crate::Error::from(error).context(format!("parsing {}", path.display())))
+    }
 
-    pub fn address(&self, port: u16) -> anyhow::Result<String> {
-        anyhow::ensure!(self.transport == "tcp", "only TCP connection files are supported in the current Rust slice");
-        anyhow::ensure!(self.signature_scheme == "hmac-sha256", "unsupported signature scheme {}", self.signature_scheme);
+    pub fn address(&self, port: u16) -> crate::Result<String> {
+        if self.transport != "tcp" { return Err(crate::Error::new(crate::ErrorKind::Unavailable, "only TCP connection files are supported")); }
+        if self.signature_scheme != "hmac-sha256" {
+            return Err(crate::Error::new(crate::ErrorKind::Unavailable, format!("unsupported signature scheme {}", self.signature_scheme)));
+        }
         Ok(format!("{}:{port}", self.ip))
     }
 }
