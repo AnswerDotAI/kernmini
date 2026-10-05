@@ -4,10 +4,6 @@ mod engine;
 mod error;
 mod kernelspec;
 mod language;
-#[cfg(feature = "python")]
-mod python;
-#[cfg(feature = "python")]
-mod python_dap;
 mod thread_worker;
 mod transport;
 mod wire;

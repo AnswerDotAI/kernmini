@@ -17,11 +17,7 @@ struct DapInner {
     next_seq: AtomicU64,
 }
 
-impl Drop for DapInner {
-    fn drop(&mut self) {
-        fail_pending(&self.pending, &self.close, Error::closed("DAP client"));
-    }
-}
+impl Drop for DapInner { fn drop(&mut self) { fail_pending(&self.pending, &self.close, Error::closed("DAP client")); } }
 
 #[derive(Clone)]
 pub struct DapClient { inner: Arc<DapInner> }
@@ -83,9 +79,7 @@ impl DapClient {
 
     pub async fn request(&self, request: Value, timeout: Duration) -> crate::Result<Value> { self.send(request).await?.wait(timeout).await }
 
-    pub fn close(&self) {
-        fail_pending(&self.inner.pending, &self.inner.close, Error::closed("DAP client"));
-    }
+    pub fn close(&self) { fail_pending(&self.inner.pending, &self.inner.close, Error::closed("DAP client")); }
 }
 
 fn encode_message(message: &Value) -> crate::Result<Vec<u8>> {
@@ -121,7 +115,11 @@ fn fail_pending(pending: &Pending, close: &watch::Sender<Option<Error>>, error: 
     for (_, complete) in pending.lock().expect("DAP pending lock poisoned").drain() { let _ = complete.send(Err(error.clone())); }
 }
 
-async fn write_messages(mut writer: impl AsyncWrite + Unpin, mut outgoing: mpsc::Receiver<Vec<u8>>, mut close: watch::Receiver<Option<Error>>) -> crate::Result<()> {
+async fn write_messages(
+    mut writer: impl AsyncWrite + Unpin,
+    mut outgoing: mpsc::Receiver<Vec<u8>>,
+    mut close: watch::Receiver<Option<Error>>,
+) -> crate::Result<()> {
     loop {
         if close.borrow().is_some() { return Ok(()); }
         tokio::select! {
@@ -143,7 +141,8 @@ async fn read_message(reader: &mut (impl AsyncBufRead + Unpin)) -> crate::Result
         if reader.read_line(&mut header).await? == 0 { return Err(Error::closed("DAP connection")); }
         if header == "\r\n" { break; }
         if let Some(value) = header.strip_prefix("Content-Length:") {
-            content_length = Some(value.trim().parse::<usize>().map_err(|error| Error::new(ErrorKind::Protocol, "invalid DAP Content-Length").caused_by(error))?);
+            content_length =
+                Some(value.trim().parse::<usize>().map_err(|error| Error::new(ErrorKind::Protocol, "invalid DAP Content-Length").caused_by(error))?);
         }
     }
     let length = content_length.ok_or_else(|| Error::new(ErrorKind::Protocol, "DAP message has no Content-Length"))?;

@@ -1,5 +1,5 @@
-use async_trait::async_trait;
 use crate::{Error, ErrorKind};
+use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -78,10 +78,7 @@ impl ExecutionInterrupt {
         self.changed.notify_waiters();
         let handler = {
             let mut registration = self.handler.lock().expect("execution interrupt lock poisoned");
-            if registration.delivered { None } else if let Some(handler) = registration.handler.clone() {
-                registration.delivered = true;
-                Some(handler)
-            } else { None }
+            if registration.delivered { None } else if let Some(handler) = registration.handler.clone() { registration.delivered = true; Some(handler) } else { None }
         };
         if let Some(handler) = handler { handler()? }
         Ok(first)
@@ -101,10 +98,7 @@ impl ExecutionInterrupt {
             let mut registration = self.handler.lock().expect("execution interrupt lock poisoned");
             if registration.handler.is_some() { return Err(Error::new(ErrorKind::InvalidInput, "execution interrupt handler already registered")); }
             registration.handler = Some(handler.clone());
-            if self.requested() && !registration.delivered {
-                registration.delivered = true;
-                true
-            } else { false }
+            if self.requested() && !registration.delivered { registration.delivered = true; true } else { false }
         };
         if deliver { handler()? }
         Ok(())
@@ -139,15 +133,9 @@ impl ExecutionContext {
         }
     }
 
-    pub async fn emit(&self, event: LanguageEvent) -> crate::Result<()> {
-        self.events.send(ContextMessage::Event(event)).await?;
-        Ok(())
-    }
+    pub async fn emit(&self, event: LanguageEvent) -> crate::Result<()> { self.events.send(ContextMessage::Event(event)).await?; Ok(()) }
 
-    pub fn emit_blocking(&self, event: LanguageEvent) -> crate::Result<()> {
-        self.events.blocking_send(ContextMessage::Event(event))?;
-        Ok(())
-    }
+    pub fn emit_blocking(&self, event: LanguageEvent) -> crate::Result<()> { self.events.blocking_send(ContextMessage::Event(event))?; Ok(()) }
 
     pub fn input(&self, prompt: impl Into<String>, password: bool) -> crate::Result<String> {
         if !self.allow_stdin { return Err(Error::new(ErrorKind::Unavailable, "input is unavailable in this execution")); }

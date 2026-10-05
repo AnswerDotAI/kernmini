@@ -1,17 +1,17 @@
 # Developer guide
 
-kernmini is one Rust kernel engine with two language boundaries: native Rust traits and a feature-gated PyO3 adapter. There is no separate Python protocol engine.
+kernmini is one Rust kernel engine with two language boundaries: native Rust traits and a separate PyO3 binding crate. There is no separate Python protocol engine.
 
 ## Development setup
 
-Kernmini is built by Maturin. In a uv workspace, run `uv sync` after cloning or changing dependency metadata. Rebuild the editable extension after Rust changes:
+In a uv workspace, run `ws-sync` after cloning or changing dependency metadata. Rebuild the editable extension after Rust changes:
 
 ```bash
-maturin develop
+cargo develop
 pytest -q
 ```
 
-`Cargo.toml` is the version source. The default crate is a reusable `rlib`; Maturin enables `extension-module` to build `kernmini._native`.
+`Cargo.toml` is the version source. The published `kernmini` crate has no Python dependency. The unpublished `kernmini-py` crate in `py/` builds `kernmini._native`. `cargo develop` and bare `cargo test` share the ordinary library builds; unit tests compile a separate `cfg(test)` executable.
 
 ## Rust architecture
 

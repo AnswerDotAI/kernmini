@@ -1,18 +1,18 @@
-use crate::{ConnectionInfo, Error, ErrorKind};
-use std::future::{Future, poll_fn};
-use std::task::Poll;
 use crate::language::{
     CompleteRequest, ContextMessage, ExecuteRequest, ExecutionContext, ExecutionInterrupt, InspectRequest, Language, LanguageEvent, LanguageMessage,
     LanguageSession, SessionCommand,
 };
 use crate::transport::{Inbound, Iopub, RouterPeers, serve_heartbeat, serve_router};
 use crate::wire::{Message, Session};
+use crate::{ConnectionInfo, Error, ErrorKind};
 use bytes::Bytes;
 use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
+use std::future::{Future, poll_fn};
 use std::path::Path;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
@@ -168,7 +168,9 @@ impl<L: LanguageSession> ShellServices<L> {
                                 let _ = complete.send(());
                             }
                             ContextMessage::Input { prompt, password, complete } => {
-                                let result = if let Some((stdin, identity)) = &stdin { stdin.request(identity, &request, prompt, password, &interrupt).await } else { Err(Error::new(ErrorKind::Unavailable, "input is unavailable outside execution")) };
+                                let result = if let Some((stdin, identity)) = &stdin {
+                                    stdin.request(identity, &request, prompt, password, &interrupt).await
+                                } else { Err(Error::new(ErrorKind::Unavailable, "input is unavailable outside execution")) };
                                 let _ = complete.send(result);
                             }
                         }
@@ -474,13 +476,19 @@ async fn run_execution(services: ShellServices<impl LanguageSession>, inbound: I
     Ok(ExecutionDone { msg_id, failed, stop_on_error })
 }
 
-async fn report_failure(services: &ShellServices<impl LanguageSession>, request: &Message, reply: &crate::transport::ReplySink, error: &Error) -> crate::Result<()> {
+async fn report_failure(
+    services: &ShellServices<impl LanguageSession>,
+    request: &Message,
+    reply: &crate::transport::ReplySink,
+    error: &Error,
+) -> crate::Result<()> {
     let ename = if error.kind() == ErrorKind::Interrupted { "KeyboardInterrupt" } else { "KernelError" };
     let content = error_content(request, services.language.execution_count(), ename, error.to_string());
     if request.msg_type() == "execute_request" { send_iopub(&services.iopub, &services.session, request, "error", content.clone()).await?; }
     if request.msg_type().ends_with("_request") {
         send_reply(reply, &services.session, request, &request.msg_type().replace("_request", "_reply"), content).await?;
-    } else { eprintln!("{} failed: {error}", request.msg_type()); }
+    }
+    else { eprintln!("{} failed: {error}", request.msg_type()); }
     status(&services.iopub, &services.session, request, "idle").await
 }
 
@@ -1018,10 +1026,12 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
                 }
                 "debug_request" => {
                     status(&iopub, &session, &request, "busy").await?;
-                    let result = control_language.debug(request.content.clone()).await.unwrap_or_else(|error| json!({"response": {
-                        "type": "response", "request_seq": request.content["seq"], "command": request.content["command"],
-                        "success": false, "message": error.to_string(),
-                    }}));
+                    let result = control_language.debug(request.content.clone()).await.unwrap_or_else(|error| {
+                        json!({"response": {
+                            "type": "response", "request_seq": request.content["seq"], "command": request.content["command"],
+                            "success": false, "message": error.to_string(),
+                        }})
+                    });
                     let response = result.get("response").cloned().unwrap_or_else(|| json!({}));
                     send_reply(&reply, &session, &request, "debug_reply", response).await?;
                     if let Some(events) = result.get("events").and_then(Value::as_array) {
@@ -1036,12 +1046,11 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
                 _ => {}
             }
         }
-    }.await;
+    }
+    .await;
     let mut result = result;
     for (_, shell) in shells.drain() {
-        if let Err(error) = stop_shell(shell, true).await {
-            if result.is_ok() { result = Err(error); } else { eprintln!("kernel shutdown failed: {error}"); }
-        }
+        if let Err(error) = stop_shell(shell, true).await { if result.is_ok() { result = Err(error); } else { eprintln!("kernel shutdown failed: {error}"); } }
     }
     background.shutdown().await;
     result
@@ -1063,7 +1072,8 @@ mod tests {
         let interrupt = ExecutionInterrupt::default();
         let read = stdin.request(&missing, &parent, "".into(), false, &interrupt);
         tokio::pin!(read);
-        poll_fn(|cx| { assert!(read.as_mut().poll(cx).is_pending()); Poll::Ready(()) }).await;
+        poll_fn(|cx| { assert!(read.as_mut().poll(cx).is_pending()); Poll::Ready(()) })
+        .await;
         interrupt.request()?;
         assert_eq!(read.await.unwrap_err().kind(), ErrorKind::Interrupted);
         assert!(stdin.pending.lock().await.is_empty());
@@ -1076,7 +1086,9 @@ mod tests {
             let prompt = session.decode(tokio::time::timeout(Duration::from_secs(2), peer.recv()).await.unwrap()?)?;
             assert_eq!(prompt.msg_type(), "input_request");
             match scenario {
-                "interrupt" => { token.request()?; }
+                "interrupt" => {
+                    token.request()?;
+                }
                 "disconnect" => drop(peer),
                 _ => {
                     let reply = session.message("input_reply", json!({"value": ""}), Some(&prompt));

@@ -1,0 +1,21 @@
+[package]
+name = "kernmini-py"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+test = false
+
+[dependencies]
+kernmini = { path = ".." }
+async-trait.workspace = true
+libc = "0.2"
+pyo3 = { version = "0.29", features = ["extension-module"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
+serde_json.workspace = true
+tokio.workspace = true
+
+[build-dependencies]
+pyo3-build-config = "0.29"

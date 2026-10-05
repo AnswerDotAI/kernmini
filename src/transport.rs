@@ -76,7 +76,9 @@ pub async fn serve_router(listener: TcpListener, session: Session, incoming: mps
 }
 
 fn peer_finished(result: Result<crate::Result<()>, JoinError>, channel: &str) -> crate::Result<()> {
-    if let Err(error) = result? && error.kind() != ErrorKind::Closed { eprintln!("{channel} peer ended: {error}"); }
+    if let Err(error) = result?
+        && error.kind() != ErrorKind::Closed
+    { eprintln!("{channel} peer ended: {error}"); }
     Ok(())
 }
 

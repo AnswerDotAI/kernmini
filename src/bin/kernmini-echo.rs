@@ -24,7 +24,8 @@ impl LanguageSession for EchoSession {
         if request.code == "adapter-error" { return Err(kernmini::Error::adapter("echo adapter failed")); }
         context.emit(LanguageEvent::Stream { name: "stdout".into(), text: format!("echo: {}\n", request.code) }).await?;
         if let Some(seconds) = request.code.strip_prefix("sleep:") {
-            let seconds = seconds.parse().map_err(|error| kernmini::Error::new(kernmini::ErrorKind::InvalidInput, "invalid sleep duration").caused_by(error))?;
+            let seconds =
+                seconds.parse().map_err(|error| kernmini::Error::new(kernmini::ErrorKind::InvalidInput, "invalid sleep duration").caused_by(error))?;
             tokio::time::sleep(std::time::Duration::from_secs_f64(seconds)).await;
         }
         let error = (request.code == "boom").then(|| LanguageError { ename: "EchoError".into(), evalue: request.code.clone(), traceback: vec![] });
@@ -52,6 +53,7 @@ impl Language for EchoLanguage {
 
 #[tokio::main]
 async fn main() -> kernmini::Result<()> {
-    let connection_file = std::env::args().nth(1).ok_or_else(|| kernmini::Error::new(kernmini::ErrorKind::InvalidInput, "usage: kernmini-echo CONNECTION_FILE"))?;
+    let connection_file =
+        std::env::args().nth(1).ok_or_else(|| kernmini::Error::new(kernmini::ErrorKind::InvalidInput, "usage: kernmini-echo CONNECTION_FILE"))?;
     kernmini::run_kernel(connection_file, EchoLanguage).await
 }
