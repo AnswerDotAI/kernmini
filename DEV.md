@@ -17,7 +17,7 @@ pytest -q
 
 The engine owns connection loading, ZMTP transport, HMAC-signed Jupyter messages, duplicate-signature rejection, shell/control routing, IOPub, stdin, heartbeat, execution scheduling, interruption, subshells, and shutdown.
 
-Synchronous interpreters can use `ThreadWorker` without another language trait. It owns only thread startup, closure dispatch, replies and shutdown; language adapters retain interruption, execution counts and all language semantics. Rustygate's Luau adapter and miniapl use it.
+Synchronous interpreters can use `ThreadWorker` without another language trait. It owns only thread startup, closure dispatch, replies and shutdown; language adapters retain interruption and all language semantics. Rustygate's Luau adapter and miniapl use it.
 
 Router and heartbeat peers are independent connection tasks. Ordinary peer EOF removes any router registration and ends silently; genuine I/O, handshake, and protocol failures are reported on kernel stderr.
 
@@ -25,6 +25,8 @@ The language boundary has two levels:
 
 - `Language` supplies the parent `LanguageSession` and creates independent child sessions.
 - `LanguageSession` supplies kernel metadata, execution, completion, inspection, completeness, history, comms, debugging, and shutdown.
+
+A `LanguageSession` is also a `Language` with that one session and no subshells, so a language without subshells passes its session straight to `run_kernel`. `run_kernel_blocking` runs a kernel on its own Tokio runtime, for a program that has none, after awaiting the future that starts its language.
 
 ### Errors
 
@@ -44,6 +46,8 @@ An execute receives an `ExecutionContext`. It emits streams and displays, reques
 
 `run_kernel` installs Tokio SIGINT handling. `run_kernel_with_interrupter` lets an embedding host supply its own `KernelInterrupter`.
 
+Kernel developers choose the Jupyter interrupt mechanism in their kernelspec. Set `"interrupt_mode": "message"` to receive `interrupt_request` on the control channel; omitting it selects signal mode. Both routes use the same language interruption handler on Unix. On Windows, use message mode: kernmini does not watch Jupyter's `JPY_INTERRUPT_EVENT` handle. The Python shell's optional native `interrupt()` hook works with message mode on every platform.
+
 `DapClient` is independent of the kernel engine and reusable by any language adapter. It owns DAP's `Content-Length` TCP framing, sequence allocation, pending responses, timeouts, asynchronous events, and connection teardown. The language adapter owns debugger startup and language-specific request handling.
 
 `install_kernelspec` writes a `kernel.json`. `install_kernelspec_dir` copies a kernelspec directory. Both replace any kernelspec of the same name in `share/jupyter/kernels` under a prefix, or else in the user Jupyter data directory. `JUPYTER_DATA_DIR` overrides the user directory. The Python functions of the same names wrap them. Their `user` parameter is accepted and ignored.
@@ -52,13 +56,12 @@ An execute receives an `ExecutionContext`. It emits streams and displays, reques
 
 The public Python `kernmini.run_kernel(connection_file, shell_factory)` is synchronous. It uses loopmini when available, falls back to the standard asyncio loop, and accepts an explicit `loop_factory`. `_native.run_kernel` is the underlying awaitable used by the wrapper.
 
-The factory takes no arguments. It creates the parent shell once and a new shell on each child session. Shared language state belongs in the factory closure, as ipymini does for its namespace.
+The factory takes no arguments and may return a shell directly or an awaitable shell. It runs on each session's owning loop, creating the parent shell once and a new shell on each child session. Initialization completes before that session serves requests. Shared language state belongs in the factory closure, as ipymini does for its namespace.
 
 A Python shell provides:
 
-- `execution_count`: current integer execution count.
 - `kernel_info()`: implementation, version, banner, and `language_info`.
-- `execute(code, silent=, store_history=, user_expressions=, allow_stdin=)`: an awaitable returning `execution_count` and optional `result`, `result_metadata`, `error`, `user_expressions`, and `payload`.
+- `execute(code, silent=, store_history=, user_expressions=, allow_stdin=, execution_count=)`: an awaitable returning optional `result`, `result_metadata`, `error`, `user_expressions`, and `payload`.
 
 The adapter uses optional capabilities when present:
 
@@ -67,20 +70,36 @@ The adapter uses optional capabilities when present:
 - `bind_kernel(kernel)` exposes the small kernel proxy expected by IPython integrations.
 - `execution_context(allow_stdin=, silent=)` wraps execution capture.
 - `output_context()` wraps output from comm handlers.
-- `complete`, `inspect`, `is_complete`, and `history` provide language services.
+- `complete`, `inspect`, `is_complete`, and `history` provide language services. They may be synchronous or awaitable; omitted services use the same default replies as Rust sessions.
 - `debug_request` and a `debugger.event_callback` provide language-specific DAP integration; `kernmini._native.DapClient` is the optional shared transport.
-- `comm_info` and `message` provide the language's comm manager and incoming comm dispatch. Kernmini knows nothing about IPython or ipymini comm objects.
+- `comm_info` and `message` provide the language's comm manager and incoming comm dispatch. Both may be synchronous or awaitable. Kernmini knows nothing about IPython or ipymini comm objects.
 - `comm_manager`, when exposed by the shell, is available through the kernel proxy passed to `bind_kernel`.
+- `interrupt()` is a synchronous native-language interrupt hook, called directly on the control thread instead of cancelling Python execution. It must be thread-safe and return promptly; it should signal the interpreter, not queue behind its execution.
+- `shutdown()` runs on the shell's owning loop before that loop stops. It may be synchronous or awaitable.
 
-The parent shell runs on a persistent asyncio loop in the Python main thread. Child shells run on supervised OS threads with their own persistent loops created by the same factory. Kernmini's multi-thread Tokio runtime independently drives transport, queues, output, control, and interrupt futures, so synchronous Python cannot block the engine.
+Python adapters for synchronous native interpreters can use the same `ThreadWorker` as Rust:
+
+```python
+from kernmini import ThreadWorker
+
+worker = await ThreadWorker.start(create_interpreter, stack_size=64*1024*1024)
+result = await worker.call(lambda interpreter: interpreter.execute(code))
+await worker.shutdown()
+```
+
+The factory and callbacks run on one dedicated thread; shutdown releases the worker's interpreter reference on that thread. `name=` names the thread; `stack_size=` is in bytes and defaults to the OS thread default. Each callback carries its caller's contextvars, so stream, display and stdin callbacks retain the active execution's routing. Callbacks are synchronous; cancelling the awaiting task does not stop an in-progress native call. A shell's `shutdown()` should explicitly free native resources through `worker.call(...)`, then await `worker.shutdown()`.
+
+The parent shell runs on a persistent asyncio loop in the Python main thread. Child shells run on supervised OS threads with their own persistent loops created by the same factory. Both use the same loop lifecycle: the loop is current while the session runs, and shutdown closes it through `asyncio.Runner`. Kernmini's multi-thread Tokio runtime independently drives transport, queues, output, control, and interrupt futures, so synchronous Python cannot block the engine.
 
 A `SystemExit` raised inside a task leaves the loop rather than the task, so `kernmini._bridge.run_loop` drives every loop and re-enters it: user code cannot end the kernel.
 
-`pyo3-async-runtimes` bridges Python awaitables onto their owning loop. Interrupts cancel async cells through that loop and inject `KeyboardInterrupt` into synchronous Python. A child blocked indefinitely in arbitrary C code cannot be interrupted safely; kernmini does not pretend otherwise.
+`pyo3-async-runtimes` bridges Python awaitables onto their owning loop. Without a shell `interrupt()` hook, interrupts cancel async cells through that loop and inject `KeyboardInterrupt` into synchronous Python. Arbitrary C code cannot be interrupted safely without its own interrupt API; native adapters use the hook to call that API.
 
 ## Execution and concurrency
 
 Each language session owns a serial execute queue. Completion, inspection, history, debugging, comms, and control requests remain responsive while a cell runs.
+
+Each session has one execution count, which the shell scheduler keeps. It starts at 1. An execute that stores history and isn't silent takes the count and advances it. Every other execute, and every reply that reports a count, uses the count unchanged. This is IPython's numbering. A language reads the count of its execution from `ExecutionContext::execution_count`, for its own `execute_result` messages and history. The Python adapter passes it to `execute` as `execution_count`, and ipymini sets IPython's counter from it.
 
 Two execute metadata extensions are supported:
 
@@ -103,7 +122,9 @@ The existing output pump drains at most one queue capacity per batch and joins a
 
 ## Lifecycle
 
-The Python wrapper may place a standalone kernel in its own process group. On shutdown it terminates that group after protocol cleanup so user-created subprocesses do not survive the kernel. It also watches the original parent PID. Embedders can pass `own_process_group=False` to avoid changing or terminating their host process group.
+On Unix, the Python wrapper may place a standalone kernel in its own process group before initializing its shell factory. On shutdown it terminates that group after protocol cleanup so user-created subprocesses do not survive the kernel. It captures the original parent PID before initialization and watches it once the engine starts. Embedders can pass `own_process_group=False` to avoid changing or terminating their host process group.
+
+On Windows, `own_process_group` has no effect. Protocol shutdown and language cleanup still run, but kernmini does not monitor parent death or terminate descendant processes. Windows wheels are built for x64 and ARM64 on CPython 3.11–3.14; integration tests run on Linux.
 
 `LanguageSession::shutdown()` is the asynchronous language lifecycle boundary. Child Python sessions stop their loop and join their thread without blocking a Tokio worker. `Drop` only requests cleanup for exceptional paths.
 

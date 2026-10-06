@@ -119,20 +119,10 @@ impl Stdin {
 }
 
 #[derive(Clone)]
-struct ShellServices<L> {
-    language: L,
-    iopub: Iopub,
-    stdin: Stdin,
-    session: Session,
-    connection: Arc<Value>,
-    supports_subshells: bool,
-    config: KernelConfig,
-    subshells: mpsc::UnboundedSender<SessionCommand>,
-    failures: mpsc::UnboundedSender<Error>,
-}
+struct ShellServices<L> { language: L, shared: KernelServices }
 
-impl<L: LanguageSession> ShellServices<L> {
-    fn output_context(&self, request: &Message, identity: Option<Bytes>, silent: bool, interrupt: ExecutionInterrupt) -> ExecutionContext {
+impl KernelServices {
+    fn output_context(&self, request: &Message, identity: Option<Bytes>, silent: bool, interrupt: ExecutionInterrupt, execution_count: u64) -> ExecutionContext {
         let (events, mut output) = event_channel(self.config.iopub_capacity);
         let execution = identity.is_some();
         let client_session = request.header.get("session").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -142,7 +132,7 @@ impl<L: LanguageSession> ShellServices<L> {
             "metadata": request.metadata, "content": request.content,
         });
         let allow_stdin = execution && request.content.get("allow_stdin").and_then(Value::as_bool).unwrap_or(true);
-        let context = ExecutionContext::new(events, interrupt.clone(), subshells, parent, allow_stdin);
+        let context = ExecutionContext::new(events, interrupt.clone(), subshells, parent, allow_stdin, execution_count);
         let iopub = self.iopub.clone();
         let session = self.session.clone();
         let request = request.clone();
@@ -241,6 +231,12 @@ async fn reply_missing(
     missing: &[&str],
 ) -> crate::Result<()> {
     let content = error_content(request, execution_count, "MissingField", format!("missing required fields: {}", missing.join(", ")));
+    reply_error(iopub, session, request, reply, content).await
+}
+
+async fn reply_error(
+    iopub: &Iopub, session: &Session, request: &Message, reply: &crate::transport::ReplySink, content: Value,
+) -> crate::Result<()> {
     if request.msg_type() == "execute_request" {
         status(iopub, session, request, "busy").await?;
         send_iopub(iopub, session, request, "error", content.clone()).await?;
@@ -274,29 +270,34 @@ fn error_content(request: &Message, execution_count: u64, ename: &str, evalue: S
     content
 }
 
+/// The execute request in `content`, with the protocol's defaults for missing fields.
+fn execute_request(content: &Value) -> ExecuteRequest {
+    ExecuteRequest {
+        code: content.get("code").and_then(Value::as_str).unwrap_or("").to_owned(),
+        silent: content.get("silent").and_then(Value::as_bool).unwrap_or(false),
+        store_history: content.get("store_history").and_then(Value::as_bool).unwrap_or(true),
+        user_expressions: content.get("user_expressions").cloned().unwrap_or_else(|| json!({})),
+        allow_stdin: content.get("allow_stdin").and_then(Value::as_bool).unwrap_or(true),
+    }
+}
 async fn execute(
     services: &ShellServices<impl LanguageSession>,
     identity: Bytes,
     request: &Message,
+    execute: ExecuteRequest,
+    execution_count: u64,
     interrupt: ExecutionInterrupt,
 ) -> crate::Result<(Value, bool)> {
     let language = &services.language;
-    let iopub = &services.iopub;
-    let session = &services.session;
-    let execute = ExecuteRequest {
-        code: request.content.get("code").and_then(Value::as_str).unwrap_or("").to_owned(),
-        silent: request.content.get("silent").and_then(Value::as_bool).unwrap_or(false),
-        store_history: request.content.get("store_history").and_then(Value::as_bool).unwrap_or(true),
-        user_expressions: request.content.get("user_expressions").cloned().unwrap_or_else(|| json!({})),
-        allow_stdin: request.content.get("allow_stdin").and_then(Value::as_bool).unwrap_or(true),
-    };
+    let iopub = &services.shared.iopub;
+    let session = &services.shared.session;
     status(iopub, session, request, "busy").await?;
     if !execute.silent {
-        send_iopub(iopub, session, request, "execute_input", json!({"code": execute.code, "execution_count": language.execution_count()})).await?;
+        send_iopub(iopub, session, request, "execute_input", json!({"code": execute.code, "execution_count": execution_count})).await?;
     }
 
     let silent = execute.silent;
-    let output = services.output_context(request, Some(identity), silent, interrupt);
+    let output = services.shared.output_context(request, Some(identity), silent, interrupt, execution_count);
     let outcome = language.execute(execute, output.clone()).await;
     let flushed = output.flush().await;
     let outcome = outcome?;
@@ -307,7 +308,7 @@ async fn execute(
         let error = json!({"ename": error.ename, "evalue": error.evalue, "traceback": error.traceback});
         send_iopub(iopub, session, request, "error", error.clone()).await?;
         json!({
-            "status": "error", "execution_count": outcome.execution_count,
+            "status": "error", "execution_count": execution_count,
             "ename": error["ename"], "evalue": error["evalue"], "traceback": error["traceback"],
         })
     } else {
@@ -318,14 +319,14 @@ async fn execute(
                 request,
                 "execute_result",
                 json!({
-                    "execution_count": outcome.execution_count,
+                    "execution_count": execution_count,
                     "data": result, "metadata": outcome.result_metadata,
                 }),
             )
             .await?;
         }
         json!({
-            "status": "ok", "execution_count": outcome.execution_count,
+            "status": "ok", "execution_count": execution_count,
             "user_expressions": outcome.user_expressions, "payload": outcome.payload,
         })
     };
@@ -346,19 +347,27 @@ impl Ord for QueueItem {
 
 enum ShellOutcome { Continue, Shutdown }
 
-struct ExecutionDone { msg_id: String, failed: bool, stop_on_error: bool }
+struct ExecutionDone { failed: bool, stop_on_error: bool }
+
+struct ActiveExecution { task: JoinHandle<crate::Result<ExecutionDone>>, interrupt: ExecutionInterrupt }
+
+impl Drop for ActiveExecution { fn drop(&mut self) { self.task.abort(); } }
+
+async fn wait_execution(active: &mut Option<ActiveExecution>) -> crate::Result<ExecutionDone> {
+    if let Some(active) = active { (&mut active.task).await? } else { std::future::pending().await }
+}
 
 enum ShellControl { Release { msg_id: String, status: String, complete: oneshot::Sender<bool> }, Interrupt, Stop }
 
-async fn handle_shell(services: &ShellServices<impl LanguageSession>, inbound: Inbound) -> crate::Result<ShellOutcome> {
+async fn handle_shell(services: &ShellServices<impl LanguageSession>, inbound: Inbound, execution_count: u64) -> crate::Result<ShellOutcome> {
     let language = &services.language;
-    let iopub = &services.iopub;
-    let session = &services.session;
+    let iopub = &services.shared.iopub;
+    let session = &services.shared.session;
     let request = inbound.message;
     let reply = inbound.reply;
     let missing = missing_fields(&request);
     if !missing.is_empty() {
-        reply_missing(language.execution_count(), iopub, session, &request, &reply, &missing).await?;
+        reply_missing(execution_count, iopub, session, &request, &reply, &missing).await?;
         return Ok(ShellOutcome::Continue);
     }
     match request.msg_type() {
@@ -367,62 +376,37 @@ async fn handle_shell(services: &ShellServices<impl LanguageSession>, inbound: I
             send_reply(&reply, session, &request, "shutdown_reply", content).await?;
             Ok(ShellOutcome::Shutdown)
         }
-        "kernel_info_request" => {
+        "kernel_info_request" | "complete_request" | "inspect_request" | "is_complete_request" | "history_request" => {
             status(iopub, session, &request, "busy").await?;
-            let info = language.kernel_info()?;
-            let content = json!({
-                "status": "ok", "protocol_version": "5.3",
-                "implementation": info.implementation,
-                "implementation_version": info.implementation_version,
-                "banner": info.banner, "language_info": info.language_info,
-                "help_links": [], "debugger": language.supports_debugger(),
-                "supported_features": match (services.supports_subshells, language.supports_debugger()) {
-                    (true, true) => vec!["kernel subshells", "debugger"],
-                    (true, false) => vec!["kernel subshells"],
-                    (false, true) => vec!["debugger"],
-                    (false, false) => vec![],
+            let content = match request.msg_type() {
+                "kernel_info_request" => {
+                    let info = language.kernel_info()?;
+                    let debugger = language.supports_debugger();
+                    let mut features = vec![];
+                    if services.shared.supports_subshells { features.push("kernel subshells"); }
+                    if debugger { features.push("debugger"); }
+                    json!({
+                        "status": "ok", "protocol_version": "5.3",
+                        "implementation": info.implementation,
+                        "implementation_version": info.implementation_version,
+                        "banner": info.banner, "language_info": info.language_info,
+                        "help_links": [], "debugger": debugger, "supported_features": features,
+                    })
                 },
-            });
-            send_reply(&reply, session, &request, "kernel_info_reply", content).await?;
-            status(iopub, session, &request, "idle").await?;
-            Ok(ShellOutcome::Continue)
-        }
-        "complete_request" => {
-            status(iopub, session, &request, "busy").await?;
-            let content = language
-                .complete(CompleteRequest {
+                "complete_request" => language.complete(CompleteRequest {
                     code: request.content.get("code").and_then(Value::as_str).unwrap_or("").to_owned(),
                     cursor_pos: request.content.get("cursor_pos").and_then(Value::as_u64).unwrap_or(0),
-                })
-                .await?;
-            send_reply(&reply, session, &request, "complete_reply", content).await?;
-            status(iopub, session, &request, "idle").await?;
-            Ok(ShellOutcome::Continue)
-        }
-        "inspect_request" => {
-            status(iopub, session, &request, "busy").await?;
-            let content = language
-                .inspect(InspectRequest {
+                }).await?,
+                "inspect_request" => language.inspect(InspectRequest {
                     code: request.content.get("code").and_then(Value::as_str).unwrap_or("").to_owned(),
                     cursor_pos: request.content.get("cursor_pos").and_then(Value::as_u64).unwrap_or(0),
                     detail_level: request.content.get("detail_level").and_then(Value::as_u64).unwrap_or(0),
-                })
-                .await?;
-            send_reply(&reply, session, &request, "inspect_reply", content).await?;
-            status(iopub, session, &request, "idle").await?;
-            Ok(ShellOutcome::Continue)
-        }
-        "is_complete_request" => {
-            status(iopub, session, &request, "busy").await?;
-            let content = language.is_complete(request.content.get("code").and_then(Value::as_str).unwrap_or("").to_owned()).await?;
-            send_reply(&reply, session, &request, "is_complete_reply", content).await?;
-            status(iopub, session, &request, "idle").await?;
-            Ok(ShellOutcome::Continue)
-        }
-        "history_request" => {
-            status(iopub, session, &request, "busy").await?;
-            let content = language.history(request.content.clone()).await?;
-            send_reply(&reply, session, &request, "history_reply", content).await?;
+                }).await?,
+                "is_complete_request" => language.is_complete(request.content.get("code").and_then(Value::as_str).unwrap_or("").to_owned()).await?,
+                "history_request" => language.history(request.content.clone()).await?,
+                _ => unreachable!(),
+            };
+            send_reply(&reply, session, &request, &request.msg_type().replace("_request", "_reply"), content).await?;
             status(iopub, session, &request, "idle").await?;
             Ok(ShellOutcome::Continue)
         }
@@ -432,11 +416,11 @@ async fn handle_shell(services: &ShellServices<impl LanguageSession>, inbound: I
             Ok(ShellOutcome::Continue)
         }
         "connect_request" => {
-            send_reply(&reply, session, &request, "connect_reply", services.connection.as_ref().clone()).await?;
+            send_reply(&reply, session, &request, "connect_reply", services.shared.connection.as_ref().clone()).await?;
             Ok(ShellOutcome::Continue)
         }
         "comm_open" | "comm_msg" | "comm_close" => {
-            let output = services.output_context(&request, None, false, ExecutionInterrupt::default());
+            let output = services.shared.output_context(&request, None, false, ExecutionInterrupt::default(), execution_count);
             language
                 .message(
                     LanguageMessage {
@@ -459,21 +443,26 @@ async fn handle_shell(services: &ShellServices<impl LanguageSession>, inbound: I
     }
 }
 
-async fn run_execution(services: ShellServices<impl LanguageSession>, inbound: Inbound, interrupt: ExecutionInterrupt) -> crate::Result<ExecutionDone> {
+async fn run_execution(
+    services: ShellServices<impl LanguageSession>,
+    inbound: Inbound,
+    execution: ExecuteRequest,
+    execution_count: u64,
+    interrupt: ExecutionInterrupt,
+) -> crate::Result<ExecutionDone> {
     let request = inbound.message;
-    let msg_id = request.msg_id().to_owned();
     let stop_on_error = request.content.get("stop_on_error").and_then(Value::as_bool).unwrap_or(true);
-    let (content, failed) = match execute(&services, inbound.identity, &request, interrupt).await {
+    let (content, failed) = match execute(&services, inbound.identity, &request, execution, execution_count, interrupt).await {
         Ok(result) => result,
         Err(error) => {
-            report_failure(&services, &request, &inbound.reply, &error).await?;
+            report_failure(&services, &request, &inbound.reply, &error, execution_count).await?;
             if error.kind() == ErrorKind::Closed { return Err(error); }
-            return Ok(ExecutionDone { msg_id, failed: true, stop_on_error });
+            return Ok(ExecutionDone { failed: true, stop_on_error });
         }
     };
-    send_reply(&inbound.reply, &services.session, &request, "execute_reply", content).await?;
-    status(&services.iopub, &services.session, &request, "idle").await?;
-    Ok(ExecutionDone { msg_id, failed, stop_on_error })
+    send_reply(&inbound.reply, &services.shared.session, &request, "execute_reply", content).await?;
+    status(&services.shared.iopub, &services.shared.session, &request, "idle").await?;
+    Ok(ExecutionDone { failed, stop_on_error })
 }
 
 async fn report_failure(
@@ -481,15 +470,16 @@ async fn report_failure(
     request: &Message,
     reply: &crate::transport::ReplySink,
     error: &Error,
+    execution_count: u64,
 ) -> crate::Result<()> {
     let ename = if error.kind() == ErrorKind::Interrupted { "KeyboardInterrupt" } else { "KernelError" };
-    let content = error_content(request, services.language.execution_count(), ename, error.to_string());
-    if request.msg_type() == "execute_request" { send_iopub(&services.iopub, &services.session, request, "error", content.clone()).await?; }
+    let content = error_content(request, execution_count, ename, error.to_string());
+    if request.msg_type() == "execute_request" { send_iopub(&services.shared.iopub, &services.shared.session, request, "error", content.clone()).await?; }
     if request.msg_type().ends_with("_request") {
-        send_reply(reply, &services.session, request, &request.msg_type().replace("_request", "_reply"), content).await?;
+        send_reply(reply, &services.shared.session, request, &request.msg_type().replace("_request", "_reply"), content).await?;
     }
     else { eprintln!("{} failed: {error}", request.msg_type()); }
-    status(&services.iopub, &services.session, request, "idle").await
+    status(&services.shared.iopub, &services.shared.session, request, "idle").await
 }
 
 async fn abort_execute(execution_count: u64, iopub: &Iopub, session: &Session, inbound: Inbound) -> crate::Result<()> {
@@ -574,10 +564,12 @@ struct Shell<L: LanguageSession> {
     queue: BinaryHeap<QueueItem>,
     order: u64,
     held: Option<Held>,
-    executions: JoinSet<crate::Result<ExecutionDone>>,
-    active: HashMap<String, ExecutionInterrupt>,
+    active: Option<ActiveExecution>,
     stopping: bool,
     interrupting: bool,
+    /// The count of the next execution that stores history. As in IPython, it starts at 1, and every other request reports it without
+    /// advancing it.
+    execution_count: u64,
 }
 
 impl<L: LanguageSession> Shell<L> {
@@ -587,12 +579,19 @@ impl<L: LanguageSession> Shell<L> {
         self.order += 1;
     }
 
+    /// The execution count for `execute`. An execution that stores history takes the count and advances it.
+    fn count_execution(&mut self, execute: &ExecuteRequest) -> u64 {
+        let count = self.execution_count;
+        if execute.store_history && !execute.silent { self.execution_count += 1 }
+        count
+    }
+
     async fn abort_pending(&mut self) -> crate::Result<()> {
         while let Ok(inbound) = self.incoming.try_recv() { self.enqueue(inbound) }
         let mut keep = vec![];
         while let Some(item) = self.queue.pop() {
             if item.inbound.message.msg_type() == "execute_request" {
-                abort_execute(self.services.language.execution_count(), &self.services.iopub, &self.services.session, item.inbound).await?;
+                abort_execute(self.execution_count, &self.services.shared.iopub, &self.services.shared.session, item.inbound).await?;
             } else { keep.push(item); }
         }
         self.queue.extend(keep);
@@ -605,9 +604,9 @@ impl<L: LanguageSession> Shell<L> {
                 let found = self.held.as_ref().is_some_and(|held| held.item.inbound.message.msg_id() == msg_id);
                 if found {
                     let failed = finish_hold(
-                        self.services.language.execution_count(),
-                        &self.services.iopub,
-                        &self.services.session,
+                        self.execution_count,
+                        &self.services.shared.iopub,
+                        &self.services.shared.session,
                         self.held.take().unwrap().item,
                         &release_status,
                     )
@@ -618,11 +617,9 @@ impl<L: LanguageSession> Shell<L> {
             }
             ShellControl::Interrupt => {
                 self.interrupting = true;
-                let mut failure = None;
-                for interrupt in self.active.values() { if let Err(error) = interrupt.request() { failure.get_or_insert(error); } }
-                if let Some(error) = failure { return Err(error); }
+                if let Some(active) = &self.active { active.interrupt.request()?; }
                 if let Some(held) = self.held.take() {
-                    finish_hold(self.services.language.execution_count(), &self.services.iopub, &self.services.session, held.item, "interrupt").await?;
+                    finish_hold(self.execution_count, &self.services.shared.iopub, &self.services.shared.session, held.item, "interrupt").await?;
                 }
                 self.abort_pending().await?;
             }
@@ -632,7 +629,7 @@ impl<L: LanguageSession> Shell<L> {
     }
 
     async fn execution_done(&mut self, done: ExecutionDone) -> crate::Result<()> {
-        self.active.remove(&done.msg_id);
+        self.active.take();
         if done.failed && done.stop_on_error && !self.interrupting { self.abort_pending().await? }
         Ok(())
     }
@@ -641,24 +638,24 @@ impl<L: LanguageSession> Shell<L> {
         if item.inbound.message.msg_type() != "execute_request" {
             let request = item.inbound.message.clone();
             let reply = item.inbound.reply.clone();
-            return match handle_shell(&self.services, item.inbound).await {
+            return match handle_shell(&self.services, item.inbound, self.execution_count).await {
                 Ok(outcome) => Ok(matches!(outcome, ShellOutcome::Shutdown)),
                 Err(error) => {
-                    report_failure(&self.services, &request, &reply, &error).await?;
+                    report_failure(&self.services, &request, &reply, &error, self.execution_count).await?;
                     if error.kind() == ErrorKind::Closed { Err(error) } else { Ok(false) }
                 }
             };
         }
         if self.interrupting {
-            interrupt_execute(self.services.language.execution_count(), &self.services.iopub, &self.services.session, item.inbound).await?;
+            interrupt_execute(self.execution_count, &self.services.shared.iopub, &self.services.shared.session, item.inbound).await?;
             return Ok(false);
         }
         let missing = missing_fields(&item.inbound.message);
         if !missing.is_empty() {
             reply_missing(
-                self.services.language.execution_count(),
-                &self.services.iopub,
-                &self.services.session,
+                self.execution_count,
+                &self.services.shared.iopub,
+                &self.services.shared.session,
                 &item.inbound.message,
                 &item.inbound.reply,
                 &missing,
@@ -667,14 +664,15 @@ impl<L: LanguageSession> Shell<L> {
             self.abort_pending().await?;
         }
         else if item.inbound.message.metadata.get("hold").and_then(Value::as_bool).unwrap_or(false) {
-            begin_hold(self.services.language.execution_count(), &self.services.iopub, &self.services.session, &item).await?;
-            self.held = Some(Held { item, deadline: tokio::time::Instant::now() + self.services.config.hold_timeout });
+            begin_hold(self.execution_count, &self.services.shared.iopub, &self.services.shared.session, &item).await?;
+            self.held = Some(Held { item, deadline: tokio::time::Instant::now() + self.services.shared.config.hold_timeout });
         }
         else {
-            let msg_id = item.inbound.message.msg_id().to_owned();
             let interrupt = ExecutionInterrupt::default();
-            self.active.insert(msg_id.clone(), interrupt.clone());
-            self.executions.spawn(run_execution(self.services.clone(), item.inbound, interrupt));
+            let execution = execute_request(&item.inbound.message.content);
+            let execution_count = self.count_execution(&execution);
+            let task = tokio::spawn(run_execution(self.services.clone(), item.inbound, execution, execution_count, interrupt.clone()));
+            self.active = Some(ActiveExecution { task, interrupt });
         }
         Ok(false)
     }
@@ -683,14 +681,17 @@ impl<L: LanguageSession> Shell<L> {
         loop {
             while let Ok(inbound) = self.incoming.try_recv() { self.enqueue(inbound) }
             while let Ok(control) = self.controls.try_recv() { self.apply_control(control).await? }
-            while let Some(result) = self.executions.try_join_next() { self.execution_done(result??).await? }
-            if self.interrupting && self.executions.is_empty() { self.interrupting = false }
-            if self.stopping && self.queue.is_empty() && self.executions.is_empty() && self.held.is_none() {
+            if self.active.as_ref().is_some_and(|active| active.task.is_finished()) {
+                let done = wait_execution(&mut self.active).await?;
+                self.execution_done(done).await?;
+            }
+            if self.interrupting && self.active.is_none() { self.interrupting = false }
+            if self.stopping && self.queue.is_empty() && self.active.is_none() && self.held.is_none() {
                 self.services.language.shutdown().await?;
                 return Ok(());
             }
 
-            if let Some(item) = pop_runnable(&mut self.queue, !self.executions.is_empty(), self.held.as_ref()) {
+            if let Some(item) = pop_runnable(&mut self.queue, self.active.is_some(), self.held.as_ref()) {
                 if self.handle_item(item).await? { return self.services.language.shutdown().await; }
                 continue;
             }
@@ -698,11 +699,9 @@ impl<L: LanguageSession> Shell<L> {
             tokio::select! {
                 message = self.incoming.recv() => self.enqueue(message.ok_or_else(|| Error::closed("shell service"))?),
                 control = self.controls.recv() => self.apply_control(control.ok_or_else(|| Error::closed("shell control"))?).await?,
-                result = self.executions.join_next(), if !self.executions.is_empty() => {
-                    self.execution_done(result.expect("non-empty execution set")??).await?;
-                }
+                result = wait_execution(&mut self.active) => self.execution_done(result?).await?,
                 _ = wait_hold(self.held.as_ref().map(|held| held.deadline)), if self.held.is_some() => {
-                    finish_hold(self.services.language.execution_count(), &self.services.iopub, &self.services.session,
+                    finish_hold(self.execution_count, &self.services.shared.iopub, &self.services.shared.session,
                         self.held.take().unwrap().item, "timeout").await?;
                     self.abort_pending().await?;
                 }
@@ -729,17 +728,7 @@ impl KernelServices {
     fn spawn_shell(&self, language: impl LanguageSession) -> ShellHandle {
         let (incoming, requests) = mpsc::channel(256);
         let (controls, shell_controls) = mpsc::channel(64);
-        let services = ShellServices {
-            language,
-            iopub: self.iopub.clone(),
-            stdin: self.stdin.clone(),
-            session: self.session.clone(),
-            connection: self.connection.clone(),
-            supports_subshells: self.supports_subshells,
-            config: self.config,
-            subshells: self.subshells.clone(),
-            failures: self.failures.clone(),
-        };
+        let services = ShellServices { language, shared: self.clone() };
         let shell = Shell {
             services,
             incoming: requests,
@@ -747,10 +736,10 @@ impl KernelServices {
             queue: BinaryHeap::new(),
             order: 0,
             held: None,
-            executions: JoinSet::new(),
-            active: HashMap::new(),
+            active: None,
             stopping: false,
             interrupting: false,
+            execution_count: 1,
         };
         ShellHandle { incoming, controls, task: tokio::spawn(shell.run()) }
     }
@@ -762,14 +751,7 @@ async fn reply_subshell_error(iopub: &Iopub, session: &Session, inbound: Inbound
     let request = inbound.message;
     if !request.msg_type().ends_with("_request") { return Ok(()); }
     let content = error_content(&request, 0, ename, evalue);
-    if request.msg_type() == "execute_request" {
-        status(iopub, session, &request, "busy").await?;
-        send_iopub(iopub, session, &request, "error", content.clone()).await?;
-    }
-    let reply_type = request.msg_type().replace("_request", "_reply");
-    send_reply(&inbound.reply, session, &request, &reply_type, content).await?;
-    if request.msg_type() == "execute_request" { status(iopub, session, &request, "idle").await? }
-    Ok(())
+    reply_error(iopub, session, &request, &inbound.reply, content).await
 }
 
 async fn reply_subshell_not_found(iopub: &Iopub, session: &Session, inbound: Inbound) -> crate::Result<()> {
@@ -783,9 +765,8 @@ async fn route_shell<L: Language>(
     services: &KernelServices,
     shells: &mut HashMap<String, ShellHandle>,
     route_overrides: &HashMap<String, String>,
-    iopub: &Iopub,
-    session: &Session,
 ) -> crate::Result<()> {
+    let (iopub, session) = (&services.iopub, &services.session);
     let explicit = subshell_id(&inbound.message);
     let client_session = inbound.message.header.get("session").and_then(Value::as_str).unwrap_or("");
     let id = if !explicit.is_empty() { explicit.to_owned() } else if inbound.message.msg_type() == "execute_request" { route_overrides.get(client_session).cloned().unwrap_or_default() } else { String::new() };
@@ -807,10 +788,8 @@ async fn route_pending_shells<L: Language>(
     services: &KernelServices,
     shells: &mut HashMap<String, ShellHandle>,
     route_overrides: &HashMap<String, String>,
-    iopub: &Iopub,
-    session: &Session,
 ) -> crate::Result<()> {
-    while let Ok(inbound) = shell.try_recv() { route_shell(inbound, language, services, shells, route_overrides, iopub, session).await? }
+    while let Ok(inbound) = shell.try_recv() { route_shell(inbound, language, services, shells, route_overrides).await? }
     Ok(())
 }
 
@@ -847,6 +826,12 @@ pub async fn run_kernel(connection_file: impl AsRef<Path>, language: impl Langua
     let result = run_kernel_with_interrupter(connection_file, language, interrupt).await;
     signals.abort();
     result
+}
+
+/// Runs `run_kernel` on a new multi-threaded Tokio runtime, for a program that has none. The runtime awaits `language` first, so
+/// starting the language can use it, as `ThreadWorker::start` does.
+pub fn run_kernel_blocking<L: Language>(connection_file: impl AsRef<Path>, language: impl Future<Output = crate::Result<L>>) -> crate::Result<()> {
+    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async { run_kernel(connection_file, language.await?).await })
 }
 
 pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, language: impl Language, interrupt: KernelInterrupter) -> crate::Result<()> {
@@ -931,7 +916,7 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
                 }
                 message = shell.recv() => {
                     let inbound = message.ok_or_else(|| Error::closed("shell service"))?;
-                    route_shell(inbound, &language, &kernel_services, &mut shells, &route_overrides, &iopub, &session).await?;
+                    route_shell(inbound, &language, &kernel_services, &mut shells, &route_overrides).await?;
                     continue;
                 }
                 command = subshell_commands.recv() => {
@@ -973,7 +958,7 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
                     return Ok(());
                 }
                 "interrupt_request" => {
-                    route_pending_shells(&mut shell, &language, &kernel_services, &mut shells, &route_overrides, &iopub, &session).await?;
+                    route_pending_shells(&mut shell, &language, &kernel_services, &mut shells, &route_overrides).await?;
                     interrupt_shells(&shells).await?;
                     send_reply(&reply, &session, &request, "interrupt_reply", json!({"status": "ok"})).await?;
                 }
@@ -1012,7 +997,7 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
                     send_reply(&reply, &session, &request, "delete_subshell_reply", content).await?;
                 }
                 "release_request" => {
-                    route_pending_shells(&mut shell, &language, &kernel_services, &mut shells, &route_overrides, &iopub, &session).await?;
+                    route_pending_shells(&mut shell, &language, &kernel_services, &mut shells, &route_overrides).await?;
                     let msg_id = request.content.get("msg_id").and_then(Value::as_str).unwrap_or("").to_owned();
                     let release_status = request.content.get("status").and_then(Value::as_str).unwrap_or("ok").to_owned();
                     let mut found = false;

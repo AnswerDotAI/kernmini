@@ -1,5 +1,5 @@
-import asyncio, contextvars
-from contextlib import nullcontext
+import asyncio, contextvars, inspect
+from contextlib import contextmanager, nullcontext
 from .concur import _subshell, sidecar, subshell
 
 _current = contextvars.ContextVar("kernmini.execution", default=None)
@@ -11,6 +11,22 @@ def run_loop(loop, fut=None):
         try: return loop.run_until_complete(fut) if fut is not None else loop.run_forever()
         except SystemExit:
             if fut is not None and fut.done(): raise
+
+
+@contextmanager
+def session_loop(loop_factory):
+    with asyncio.Runner(loop_factory=loop_factory) as runner:
+        loop = runner.get_loop()
+        asyncio.set_event_loop(loop)
+        try: yield loop
+        finally: asyncio.set_event_loop(None)
+
+
+def run_child_loop(factory, loop_factory, ready):
+    with session_loop(loop_factory) as loop:
+        target = run_loop(loop, loop.create_task(create_shell(factory)))
+        ready(loop, target)
+        run_loop(loop)
 
 
 class _IOPub:
@@ -31,12 +47,39 @@ class NativeKernel:
     def comm_manager(self): return self.target.comm_manager
 
 
-def kernel_proxy(target): return NativeKernel(target)
+def stream(name, text):
+    sink = _current.get()
+    if sink is not None: sink.stream(name, text)
 
 
-async def execute(target, current, sink, code, **kwargs):
+def display(event):
+    sink = _current.get()
+    if sink is not None: sink.display(event)
+
+
+def request_input(prompt, password):
+    sink = _current.get()
+    if sink is not None: return sink.input(prompt, password)
+    from ._native import KernelError
+    error = KernelError('input requested outside an execution')
+    error.kind = 'Unavailable'
+    raise error
+
+
+def bind_shell(target):
+    for method,callback in [('set_stream_sender', stream), ('set_display_sender', display), ('set_input_sender', request_input)]:
+        if hasattr(target, method): getattr(target, method)(callback)
+    if hasattr(target, 'bind_kernel'): target.bind_kernel(NativeKernel(target))
+
+
+async def create_shell(factory):
+    target = factory()
+    return await target if inspect.isawaitable(target) else target
+
+
+async def execute(target, sink, code, **kwargs):
     "Run one Python execution with its task-local routing and capture context."
-    token = current.set(sink)
+    token = _current.set(sink)
     subshell_token = _subshell.set(sink)
     sink.started(asyncio.current_task())
     try:
@@ -45,21 +88,27 @@ async def execute(target, current, sink, code, **kwargs):
         with context: return await target.execute(code, **kwargs)
     finally:
         _subshell.reset(subshell_token)
-        current.reset(token)
+        _current.reset(token)
 
 
-def request(target, method, content):
-    if method == "comm_info" and not hasattr(target, method): return {"status": "ok", "comms": {}}
-    return getattr(target, method)(**content)
+async def request(target, method, content):
+    if not hasattr(target, method): return
+    result = getattr(target, method)(**content)
+    return await result if inspect.isawaitable(result) else result
 
 
-async def request_async(target, method, content): return request(target, method, content)
+async def shutdown(target):
+    if hasattr(target, "shutdown"):
+        result = target.shutdown()
+        if inspect.isawaitable(result): await result
 
 
-async def message(target, current, sink, msg_type, content, buffers):
-    token = current.set(sink)
+async def message(target, sink, msg_type, content, buffers):
+    token = _current.set(sink)
     try:
         context = target.output_context() if hasattr(target, "output_context") else nullcontext()
         if hasattr(target, "message"):
-            with context: target.message(msg_type, content, list(buffers))
-    finally: current.reset(token)
+            with context:
+                result = target.message(msg_type, content, buffers)
+                if inspect.isawaitable(result): await result
+    finally: _current.reset(token)

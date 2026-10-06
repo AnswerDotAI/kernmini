@@ -1,14 +1,14 @@
 use async_trait::async_trait;
 use kernmini::{
     CompleteRequest, DebugEventSender, Error, ErrorKind, ExecuteOutcome, ExecuteRequest, ExecutionContext, InspectRequest, KernelInfo, KernelInterrupter,
-    Language, LanguageError, LanguageEvent, LanguageMessage, LanguageSession,
+    Language, LanguageError, LanguageEvent, LanguageMessage, LanguageSession, reply_defaults,
 };
 use pyo3::exceptions::{PyKeyboardInterrupt, PyOSError, PyRuntimeError, PyTimeoutError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList};
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 
 pyo3::create_exception!(_native, KernelError, PyRuntimeError);
@@ -76,12 +76,18 @@ impl ExecutionSink {
         self.context
             .set_interrupt_handler(Arc::new(move || {
                 Python::attach(|py| -> PyResult<()> {
-                    let sync_thread = target.getattr(py, "_sync_thread_id")?;
+                    interrupted.store(true, AtomicOrdering::Release);
+                    if target.bind(py).hasattr("interrupt")? {
+                        target.call_method0(py, "interrupt")?;
+                        return Ok(());
+                    }
+                    let sync_thread = if target.bind(py).hasattr("_sync_thread_id")? { target.getattr(py, "_sync_thread_id")? } else { py.None() };
                     if !sync_thread.is_none(py) {
-                        let thread_id: libc::c_long = sync_thread.extract(py)?;
-                        let changed = unsafe { pyo3::ffi::PyThreadState_SetAsyncExc(thread_id, pyo3::ffi::PyExc_KeyboardInterrupt) };
+                        let thread_id: libc::c_ulong = sync_thread.extract(py)?;
+                        // CPython uses unsigned long; PyO3 declares the argument as signed.
+                        let changed = unsafe { pyo3::ffi::PyThreadState_SetAsyncExc(thread_id as libc::c_long, pyo3::ffi::PyExc_KeyboardInterrupt) };
                         if changed > 1 {
-                            unsafe { pyo3::ffi::PyThreadState_SetAsyncExc(thread_id, std::ptr::null_mut()); }
+                            unsafe { pyo3::ffi::PyThreadState_SetAsyncExc(thread_id as libc::c_long, std::ptr::null_mut()); }
                             return Err(PyRuntimeError::new_err("interrupt matched multiple Python threads"));
                         }
                         #[cfg(unix)]
@@ -91,7 +97,6 @@ impl ExecutionSink {
                     }
                     let cancel = task.getattr(py, "cancel")?;
                     locals.event_loop(py).call_method1("call_soon_threadsafe", (cancel,))?;
-                    interrupted.store(true, AtomicOrdering::Release);
                     Ok(())
                 })
                 .map_err(Error::adapter)
@@ -154,27 +159,15 @@ impl ExecutionSink {
 }
 
 #[pyclass]
-struct StreamRouter { current: Py<PyAny> }
-
-#[pymethods]
-impl StreamRouter {
-    fn __call__(&self, py: Python<'_>, name: String, text: String) -> PyResult<()> {
-        let sink = self.current.call_method0(py, "get")?;
-        if !sink.is_none(py) { sink.call_method1(py, "stream", (name, text))?; }
-        Ok(())
-    }
-}
-
-#[pyclass]
-struct DisplayRouter { current: Py<PyAny> }
-
-#[pyclass]
 struct SignalRouter { interrupt: KernelInterrupter, target: Py<PyAny> }
 
 #[pymethods]
 impl SignalRouter {
     fn __call__(&self, py: Python<'_>, _signum: i32, _frame: Py<PyAny>) -> PyResult<()> {
-        if !self.target.getattr(py, "_sync_thread_id")?.is_none(py) { return Err(PyKeyboardInterrupt::new_err("")); }
+        if !self.target.bind(py).hasattr("interrupt")?
+            && self.target.bind(py).hasattr("_sync_thread_id")?
+            && !self.target.getattr(py, "_sync_thread_id")?.is_none(py)
+        { return Err(PyKeyboardInterrupt::new_err("")); }
         self.interrupt.interrupt();
         Ok(())
     }
@@ -185,29 +178,6 @@ struct DebugRouter { sender: DebugEventSender }
 
 #[pymethods]
 impl DebugRouter { fn __call__(&self, py: Python<'_>, event: &Bound<'_, PyAny>) -> PyResult<()> { (self.sender)(py_to_json(py, event)?); Ok(()) } }
-
-#[pyclass]
-struct InputRouter { current: Py<PyAny> }
-
-#[pymethods]
-impl InputRouter {
-    fn __call__(&self, py: Python<'_>, prompt: String, password: bool) -> PyResult<String> {
-        let sink = self.current.call_method0(py, "get")?;
-        if sink.is_none(py) { return Err(py_error(Error::new(ErrorKind::Unavailable, "input requested outside an execution"))); }
-        sink.call_method1(py, "input", (prompt, password))?.extract(py)
-    }
-}
-
-#[pymethods]
-impl DisplayRouter {
-    fn __call__(&self, py: Python<'_>, event: Py<PyAny>) -> PyResult<()> {
-        let sink = self.current.call_method0(py, "get")?;
-        if !sink.is_none(py) { sink.call_method1(py, "display", (event,))?; }
-        Ok(())
-    }
-}
-
-fn context_var(py: Python<'_>) -> PyResult<Py<PyAny>> { Ok(py.import("kernmini._bridge")?.getattr("_current")?.unbind()) }
 
 struct ChildLoop { event_loop: Mutex<Option<Py<PyAny>>>, thread: Mutex<Option<JoinHandle<()>>> }
 
@@ -241,7 +211,6 @@ impl Drop for ChildLoop {
 
 struct PyLanguageSession {
     target: Py<PyAny>,
-    current: Py<PyAny>,
     locals: pyo3_async_runtimes::TaskLocals,
     _child_loop: Option<Arc<ChildLoop>>,
 }
@@ -250,7 +219,6 @@ impl Clone for PyLanguageSession {
     fn clone(&self) -> Self {
         Python::attach(|py| Self {
             target: self.target.clone_ref(py),
-            current: self.current.clone_ref(py),
             locals: self.locals.clone(),
             _child_loop: self._child_loop.clone(),
         })
@@ -264,37 +232,40 @@ impl PyLanguageSession {
     }
 
     fn with_locals(py: Python<'_>, target: Py<PyAny>, locals: pyo3_async_runtimes::TaskLocals, child_loop: Option<Arc<ChildLoop>>) -> PyResult<Self> {
-        let current = context_var(py)?;
-        if target.bind(py).hasattr("set_stream_sender")? {
-            let sender = Py::new(py, StreamRouter { current: current.clone_ref(py) })?;
-            target.call_method1(py, "set_stream_sender", (sender,))?;
-        }
-        if target.bind(py).hasattr("set_display_sender")? {
-            let sender = Py::new(py, DisplayRouter { current: current.clone_ref(py) })?;
-            target.call_method1(py, "set_display_sender", (sender,))?;
-        }
-        if target.bind(py).hasattr("set_input_sender")? {
-            let sender = Py::new(py, InputRouter { current: current.clone_ref(py) })?;
-            target.call_method1(py, "set_input_sender", (sender,))?;
-        }
-        if target.bind(py).hasattr("bind_kernel")? {
-            let kernel = py.import("kernmini._bridge")?.call_method1("kernel_proxy", (target.clone_ref(py),))?;
-            target.call_method1(py, "bind_kernel", (kernel,))?;
-        }
-        Ok(Self { target, current, locals, _child_loop: child_loop })
+        py.import("kernmini._bridge")?.call_method1("bind_shell", (target.clone_ref(py),))?;
+        Ok(Self { target, locals, _child_loop: child_loop })
     }
 
-    async fn request(&self, method: &str, content: Value) -> kernmini::Result<Value> {
+    async fn request(&self, method: &str, content: Value) -> kernmini::Result<Option<Value>> {
         let target = Python::attach(|py| self.target.clone_ref(py));
         let locals = self.locals.clone();
         let future = Python::attach(|py| -> PyResult<_> {
             let bridge = py.import("kernmini._bridge")?;
-            let awaitable = bridge.call_method1("request_async", (target, method, json_to_py(py, &content)?))?;
+            let awaitable = bridge.call_method1("request", (target, method, json_to_py(py, &content)?))?;
             pyo3_async_runtimes::into_future_with_locals(&locals, awaitable)
         })
         .map_err(Error::adapter)?;
         let result = future.await.map_err(Error::adapter)?;
-        Python::attach(|py| py_to_json(py, result.bind(py))).map_err(Error::adapter)
+        Python::attach(|py| if result.is_none(py) { Ok(None) } else { py_to_json(py, result.bind(py)).map(Some) }).map_err(Error::adapter)
+    }
+}
+
+type SessionReady = Arc<Mutex<Option<tokio::sync::oneshot::Sender<kernmini::Result<PyLanguageSession>>>>>;
+
+#[pyclass]
+struct ChildReady { created: SessionReady, child_loop: Weak<ChildLoop> }
+
+#[pymethods]
+impl ChildReady {
+    fn __call__(&self, py: Python<'_>, event_loop: Py<PyAny>, target: Py<PyAny>) -> PyResult<()> {
+        let child_loop = self.child_loop.upgrade().ok_or_else(|| py_error(Error::closed("child Python session during startup")))?;
+        *child_loop.event_loop.lock().expect("child loop lock poisoned") = Some(event_loop.clone_ref(py));
+        let locals = pyo3_async_runtimes::TaskLocals::new(event_loop.bind(py).clone()).copy_context(py)?;
+        let session = PyLanguageSession::with_locals(py, target, locals, Some(child_loop))?;
+        if self.created.lock().expect("child startup lock poisoned").take().unwrap().send(Ok(session)).is_err() {
+            event_loop.call_method0(py, "stop")?;
+        }
+        Ok(())
     }
 }
 
@@ -312,25 +283,17 @@ impl Language for PyLanguage {
         let factory = Python::attach(|py| self.factory.clone_ref(py));
         let loop_factory = Python::attach(|py| self.loop_factory.clone_ref(py));
         let child_loop = Arc::new(ChildLoop::new());
-        let thread_loop = child_loop.clone();
+        let thread_loop = Arc::downgrade(&child_loop);
         let (created, result) = tokio::sync::oneshot::channel();
+        let created = Arc::new(Mutex::new(Some(created)));
         let thread = std::thread::spawn(move || {
-            let mut created = Some(created);
             let outcome = Python::attach(|py| -> PyResult<()> {
-                let asyncio = py.import("asyncio")?;
-                let event_loop = loop_factory.call0(py)?;
-                asyncio.call_method1("set_event_loop", (&event_loop,))?;
-                *thread_loop.event_loop.lock().expect("child loop lock poisoned") = Some(event_loop.clone_ref(py));
-                let target = factory.call0(py)?;
-                let locals = pyo3_async_runtimes::TaskLocals::new(event_loop.bind(py).clone()).copy_context(py)?;
-                let session = PyLanguageSession::with_locals(py, target, locals, Some(thread_loop.clone()))?;
-                if created.take().unwrap().send(Ok(session)).is_err() { return Ok(()); }
-                drop(thread_loop);
-                py.import("kernmini._bridge")?.call_method1("run_loop", (&event_loop,))?;
+                let ready = Py::new(py, ChildReady { created: created.clone(), child_loop: thread_loop })?;
+                py.import("kernmini._bridge")?.call_method1("run_child_loop", (factory, loop_factory, ready))?;
                 Ok(())
             });
             if let Err(error) = outcome
-                && let Some(created) = created.take()
+                && let Some(created) = created.lock().expect("child startup lock poisoned").take()
             { let _ = created.send(Err(Error::adapter(error))); }
         });
         *child_loop.thread.lock().expect("child thread lock poisoned") = Some(thread);
@@ -353,8 +316,6 @@ impl LanguageSession for PyLanguageSession {
         .map_err(Error::adapter)
     }
 
-    fn execution_count(&self) -> u64 { Python::attach(|py| self.target.getattr(py, "execution_count").and_then(|value| value.extract(py))).unwrap_or(0) }
-
     fn supports_debugger(&self) -> bool { Python::attach(|py| self.target.bind(py).hasattr("debug_request")).unwrap_or(false) }
 
     fn set_debug_sender(&self, sender: DebugEventSender) -> kernmini::Result<()> {
@@ -369,7 +330,6 @@ impl LanguageSession for PyLanguageSession {
 
     async fn execute(&self, request: ExecuteRequest, context: ExecutionContext) -> kernmini::Result<ExecuteOutcome> {
         let target = Python::attach(|py| self.target.clone_ref(py));
-        let current = Python::attach(|py| self.current.clone_ref(py));
         let locals = self.locals.clone();
         let interrupted = Arc::new(AtomicBool::new(false));
         let future = Python::attach(|py| -> PyResult<_> {
@@ -388,8 +348,9 @@ impl LanguageSession for PyLanguageSession {
             kwargs.set_item("store_history", request.store_history)?;
             kwargs.set_item("user_expressions", json_to_py(py, &request.user_expressions)?)?;
             kwargs.set_item("allow_stdin", request.allow_stdin)?;
+            kwargs.set_item("execution_count", context.execution_count())?;
             let bridge = py.import("kernmini._bridge")?;
-            let awaitable = bridge.call_method("execute", (target, current, sink, request.code), Some(&kwargs))?;
+            let awaitable = bridge.call_method("execute", (target, sink, request.code), Some(&kwargs))?;
             pyo3_async_runtimes::into_future_with_locals(&locals, awaitable)
         })
         .map_err(Error::adapter)?;
@@ -419,7 +380,6 @@ impl LanguageSession for PyLanguageSession {
             error = Some(LanguageError { ename: "KeyboardInterrupt".into(), evalue: "".into(), traceback: vec![] });
         }
         Ok(ExecuteOutcome {
-            execution_count: value["execution_count"].as_u64().unwrap_or(0),
             result: value.get("result").filter(|result| !result.is_null()).cloned(),
             result_metadata: value.get("result_metadata").cloned().unwrap_or_else(|| json!({})),
             error,
@@ -429,20 +389,23 @@ impl LanguageSession for PyLanguageSession {
     }
 
     async fn complete(&self, request: CompleteRequest) -> kernmini::Result<Value> {
-        self.request("complete", json!({"code": request.code, "cursor_pos": request.cursor_pos})).await
+        Ok(self.request("complete", json!({"code": request.code, "cursor_pos": request.cursor_pos})).await?
+            .unwrap_or_else(|| reply_defaults::complete(request.cursor_pos)))
     }
 
     async fn inspect(&self, request: InspectRequest) -> kernmini::Result<Value> {
-        self.request("inspect", json!({"code": request.code, "cursor_pos": request.cursor_pos, "detail_level": request.detail_level})).await
+        Ok(self.request("inspect", json!({"code": request.code, "cursor_pos": request.cursor_pos, "detail_level": request.detail_level})).await?
+            .unwrap_or_else(reply_defaults::inspect))
     }
 
-    async fn is_complete(&self, code: String) -> kernmini::Result<Value> { self.request("is_complete", json!({"code": code})).await }
+    async fn is_complete(&self, code: String) -> kernmini::Result<Value> { Ok(self.request("is_complete", json!({"code": code})).await?.unwrap_or_else(reply_defaults::is_complete)) }
 
-    async fn history(&self, request: Value) -> kernmini::Result<Value> { self.request("history", request).await }
+    async fn history(&self, request: Value) -> kernmini::Result<Value> { Ok(self.request("history", request).await?.unwrap_or_else(reply_defaults::history)) }
 
-    async fn comm_info(&self, request: Value) -> kernmini::Result<Value> { self.request("comm_info", request).await }
+    async fn comm_info(&self, request: Value) -> kernmini::Result<Value> { Ok(self.request("comm_info", request).await?.unwrap_or_else(reply_defaults::comm_info)) }
 
     async fn debug(&self, request: Value) -> kernmini::Result<Value> {
+        if !self.supports_debugger() { return Ok(reply_defaults::debug()); }
         let target = Python::attach(|py| self.target.clone_ref(py));
         tokio::task::spawn_blocking(move || {
             Python::attach(|py| -> PyResult<Value> {
@@ -456,13 +419,12 @@ impl LanguageSession for PyLanguageSession {
 
     async fn message(&self, message: LanguageMessage, context: ExecutionContext) -> kernmini::Result<()> {
         let target = Python::attach(|py| self.target.clone_ref(py));
-        let current = Python::attach(|py| self.current.clone_ref(py));
         let locals = self.locals.clone();
         let future = Python::attach(|py| -> PyResult<_> {
             let sink = Py::new(py, ExecutionSink { context, target: None, locals: None, interrupted: None, wake_sync: false })?;
             let buffers = PyList::new(py, message.buffers.iter().map(|buffer| PyBytes::new(py, buffer)))?;
             let bridge = py.import("kernmini._bridge")?;
-            let awaitable = bridge.call_method1("message", (target, current, sink, message.msg_type, json_to_py(py, &message.content)?, buffers))?;
+            let awaitable = bridge.call_method1("message", (target, sink, message.msg_type, json_to_py(py, &message.content)?, buffers))?;
             pyo3_async_runtimes::into_future_with_locals(&locals, awaitable)
         })
         .map_err(Error::adapter)?;
@@ -470,26 +432,28 @@ impl LanguageSession for PyLanguageSession {
         Ok(())
     }
 
-    async fn shutdown(&self) -> kernmini::Result<()> { if let Some(child_loop) = &self._child_loop { child_loop.shutdown().await? } Ok(()) }
+    async fn shutdown(&self) -> kernmini::Result<()> {
+        let future = Python::attach(|py| -> PyResult<_> {
+            let awaitable = py.import("kernmini._bridge")?.call_method1("shutdown", (self.target.clone_ref(py),))?;
+            pyo3_async_runtimes::into_future_with_locals(&self.locals, awaitable)
+        }).map_err(Error::adapter)?;
+        let result = future.await.map_err(Error::adapter);
+        if let Some(child_loop) = &self._child_loop { child_loop.shutdown().await? }
+        result.map(|_| ())
+    }
 }
 
 #[pyfunction]
-#[pyo3(signature = (connection_file, factory, loop_factory, own_process_group=false))]
+#[pyo3(signature = (connection_file, target, factory, loop_factory, owns_process_group, parent_pid))]
 fn run_kernel<'py>(
     py: Python<'py>,
     connection_file: String,
+    target: Py<PyAny>,
     factory: Py<PyAny>,
     loop_factory: Py<PyAny>,
-    own_process_group: bool,
+    owns_process_group: bool,
+    parent_pid: i32,
 ) -> PyResult<Bound<'py, PyAny>> {
-    #[cfg(unix)]
-    let owns_process_group = own_process_group
-        && unsafe { let pid = libc::getpid(); (libc::getpgrp() == pid || libc::setpgid(0, 0) == 0) && libc::getpgrp() == pid };
-    #[cfg(not(unix))]
-    let owns_process_group = false;
-    #[cfg(unix)]
-    let parent_pid = unsafe { libc::getppid() };
-    let target = factory.call0(py)?;
     let interrupt = KernelInterrupter::default();
     let signal = py.import("signal")?;
     let signal_router = Py::new(py, SignalRouter { interrupt: interrupt.clone(), target: target.clone_ref(py) })?;
@@ -554,6 +518,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     runtime.enable_all().worker_threads(2);
     pyo3_async_runtimes::tokio::init(runtime);
     crate::python_dap::register(module)?;
+    crate::python_worker::register(module)?;
     module.add("KernelError", module.py().get_type::<KernelError>())?;
     module.add_function(wrap_pyfunction!(run_kernel, module)?)?;
     module.add_function(wrap_pyfunction!(install_kernelspec, module)?)?;

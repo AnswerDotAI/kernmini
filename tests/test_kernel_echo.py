@@ -1,6 +1,6 @@
 "The Python adapter running a trivial shell over the native kernmini engine."
 
-import asyncio, os, sys
+import asyncio, json, os, sys
 from pathlib import Path
 
 import pytest
@@ -43,6 +43,10 @@ async def echo_kernel_story(kc, supported_features=None, binary=False):
     assert info['msg_type'] == 'kernel_info_reply'
     assert content['implementation'] == 'echokernel' and content['language_info']['name'] == 'echo'
     assert content['supported_features'] == (supported_features or []) and content['debugger'] is False
+    assert (await kc.shell_request('complete_request', code='hello', cursor_pos=5))['content']['matches'] == []
+    assert (await kc.shell_request('inspect_request', code='hello', cursor_pos=5))['content']['found'] is False
+    assert (await kc.shell_request('is_complete_request', code='hello'))['content']['status'] == 'unknown'
+    assert (await kc.shell_request('history_request', hist_access_type='tail'))['content']['history'] == []
 
     msgs = await _run(kc, 'hello world')
     reply = _one(msgs, 'execute_reply')
@@ -133,3 +137,39 @@ async def test_hold_timeout():
     async with run_kernel('echo', ECHO_ARGV, env=env) as (_, kc):
         reply = await kc.reply('', metadata=dict(hold=True), timeout=5)
         assert (reply['content']['status'], reply['content']['ename']) == ('error', 'HoldTimeout')
+
+
+@pytest.mark.parametrize('subshell_id', [None, 'worker'])
+async def test_threaded_interpreter(tmp_path, subshell_id):
+    record_path = tmp_path/'shutdown.json'
+    argv = [sys.executable, str(ROOT/'tests'/'thread_kernel.py'), str(record_path), '{connection_file}']
+    async with run_kernel('threaded-echo', argv) as (_, kc):
+        kwargs = dict(subshell_id=subshell_id) if subshell_id else {}
+        assert (await kc.shell_request('is_complete_request', code='thread', **kwargs))['content']['status'] == 'complete'
+        msgs = await _run(kc, 'thread', **kwargs)
+        worker_id = int(_one(msgs, 'execute_result')['content']['data']['text/plain'])
+        running = kc.run('wait', timeout=10, **kwargs)
+        msgs = await _until_stream(running, 'worker: wait\n')
+        await kc.interrupt(timeout=5)
+        msgs += [msg async for msg in running]
+        assert _one(msgs, 'execute_reply')['content']['ename'] == 'NativeInterrupt'
+        assert _one(await _run(kc, 'thread', **kwargs), 'execute_result')['content']['data']['text/plain'] == str(worker_id)
+        if subshell_id:
+            assert (await kc.ctl.delete_subshell(subshell_id=subshell_id, timeout=5))['content']['status'] == 'ok'
+            record = json.loads(record_path.read_text())
+        else: await kc.ctl.shutdown(restart=False, timeout=5)
+    if not subshell_id: record = json.loads(record_path.read_text())
+    assert record['init'] == record['execute'] == record['drop'] == worker_id
+    assert record['loop'] == record['shutdown'] != worker_id
+    assert record['interrupt'] not in (worker_id, record['loop'])
+
+
+async def test_worker_callback_error():
+    from kernmini import ThreadWorker, KernelError
+    worker = await ThreadWorker.start(lambda: None)
+    def fail(state): raise ValueError('callback failed')
+    with pytest.raises(ValueError, match='callback failed'): await worker.call(fail)
+    assert await worker.call(lambda state: 42) == 42
+    await worker.shutdown()
+    with pytest.raises(KernelError) as failed: await worker.call(lambda state: None)
+    assert failed.value.kind == 'Closed'

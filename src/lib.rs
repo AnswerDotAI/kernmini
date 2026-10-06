@@ -10,12 +10,12 @@ mod wire;
 
 pub use connection::ConnectionInfo;
 pub use dap::{DapClient, DapRequest};
-pub use engine::{KernelInterrupter, run_kernel, run_kernel_with_interrupter};
+pub use engine::{KernelInterrupter, run_kernel, run_kernel_blocking, run_kernel_with_interrupter};
 pub use error::{Error, ErrorKind, Result};
 pub use kernelspec::{install_kernelspec, install_kernelspec_dir, jupyter_data_dir, kernels_dir};
 pub use language::{
     CompleteRequest, DebugEventSender, ExecuteOutcome, ExecuteRequest, ExecutionContext, ExecutionInterrupt, InspectRequest, InterruptHandler, KernelInfo,
-    Language, LanguageError, LanguageEvent, LanguageMessage, LanguageSession,
+    Language, LanguageError, LanguageEvent, LanguageMessage, LanguageSession, reply_defaults,
 };
 pub use thread_worker::ThreadWorker;
 pub use wire::{Message, Session, WireError};
