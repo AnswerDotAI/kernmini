@@ -19,8 +19,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e '.[dev]'
-      - run: pip install git+https://github.com/AnswerDotAI/ipymini
-      - run: pytest -q
+      - run: pytest -q --ignore=tests/test_ipymini.py
 
   rust:
     runs-on: ubuntu-latest

@@ -1,15 +1,15 @@
 "The real ipymini language adapter hosted directly by kernmini and driven by ConKernelClient."
 
-import os
+import asyncio, os, sys
 
 import pytest
 from conkernelclient import JmsgQueues, run_kernel
 from jupywire.ops import parent_id
 
-from test_kernel_echo import ROOT, _one, _pubs, _run, _until_stream
+from test_kernel_echo import _one, _pubs, _run, _until_stream
 
 
-IPYTHON_ARGV = [__import__('sys').executable, str(ROOT/'tests'/'ipython_kernel.py'), '{connection_file}']
+IPYTHON_ARGV = [sys.executable, __file__, '{connection_file}']
 
 
 @pytest.mark.asyncio
@@ -126,3 +126,17 @@ async def test_ipython_story():
         assert states == ['busy', 'idle']
         missing = await kc.shell_request('complete_request', timeout=5)
         assert missing['content']['status'] == 'error' and missing['content']['matches'] == []
+
+
+if __name__ == "__main__":
+    from ipymini.shell import MiniShell
+    from kernmini import run_kernel as serve_kernel
+
+    user_ns, first = {}, True
+    def shell_factory():
+        global first
+        shell = MiniShell(request_input=lambda *_: "", user_ns=user_ns, use_singleton=first)
+        first = False
+        return shell
+
+    serve_kernel(sys.argv[-1], shell_factory, loop_factory=asyncio.new_event_loop)

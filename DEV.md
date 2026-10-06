@@ -130,13 +130,17 @@ On Windows, `own_process_group` has no effect. Protocol shutdown and language cl
 
 ## Tests
 
-`pytest -q` contains three readable end-to-end stories:
+`pytest -q` runs the protocol tests and local IPython integration tests:
 
 - a Python echo shell through the public PyO3 runner;
 - a pure Rust echo language, implemented entirely in the example binary, through the crate API;
 - an IPython shell through the Python adapter.
 
-`ConKernelClient` launches each kernel and manages its Jupyter requests, replies, IOPub messages, stdin, and shutdown. Tests use live protocol events to synchronize concurrent behavior rather than sleeps or hand-written socket draining. Standalone Rust tests cover wire framing and language interruption primitives. A Python integration test drives a real debugpy session through the DAP transport directly, since that transport is the subject of the test. ipymini's complete protocol and behavior suite is kernmini's main integration test.
+`ConKernelClient` launches each kernel and manages its Jupyter requests, replies, IOPub messages, stdin, and shutdown. Tests use live protocol events to synchronize concurrent behavior rather than sleeps or hand-written socket draining. Standalone Rust tests cover wire framing and language interruption primitives. A Python integration test drives a real debugpy session through the DAP transport directly, since that transport is the subject of the test.
+
+`tests/test_ipymini.py` contains the IPython tests and their kernel launcher. Run these locally with the workspace's `ipymini` checkout. Kernmini CI does not install `ipymini` and runs `pytest -q --ignore=tests/test_ipymini.py`.
+
+Release kernmini before ipymini. Ipymini depends on released kernmini from PyPI. Run ipymini's full protocol and behavior suite locally with both workspace checkouts:
 
 ```bash
 cd ../ipymini
