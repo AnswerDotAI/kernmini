@@ -9,22 +9,14 @@ const DELIMITER: &[u8] = b"<IDS|MSG>";
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug)]
-pub enum WireError {
-    MissingDelimiter,
-    MissingParts,
-    BadSignature,
-    DuplicateSignature,
-    Json(serde_json::Error),
-}
+pub enum WireError { MissingDelimiter, MissingParts, BadSignature, DuplicateSignature, Json(serde_json::Error) }
 
 impl std::fmt::Display for WireError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingDelimiter => write!(f, "missing <IDS|MSG> delimiter"),
-            Self::MissingParts => write!(f, "insufficient Jupyter message parts"),
-            Self::BadSignature => write!(f, "invalid message signature"),
-            Self::DuplicateSignature => write!(f, "duplicate message signature"),
-            Self::Json(error) => write!(f, "invalid message JSON: {error}"),
+            Self::MissingDelimiter => write!(f, "missing <IDS|MSG> delimiter"), Self::MissingParts => write!(f, "insufficient Jupyter message parts"),
+            Self::BadSignature => write!(f, "invalid message signature"), Self::DuplicateSignature => write!(f, "duplicate message signature"),
+            Self::Json(error) => write!(f, "invalid message JSON: {error}")
         }
     }
 }
@@ -37,12 +29,8 @@ impl From<serde_json::Error> for WireError { fn from(error: serde_json::Error) -
 
 #[derive(Clone, Debug)]
 pub struct Message {
-    pub identities: Vec<Bytes>,
-    pub header: Map<String, Value>,
-    pub parent_header: Map<String, Value>,
-    pub metadata: Map<String, Value>,
-    pub content: Value,
-    pub buffers: Vec<Bytes>,
+    pub identities: Vec<Bytes>, pub header: Map<String, Value>, pub parent_header: Map<String, Value>, pub metadata: Map<String, Value>, pub content: Value,
+    pub buffers: Vec<Bytes>
 }
 
 impl Message {
@@ -52,21 +40,12 @@ impl Message {
 }
 
 #[derive(Clone)]
-pub struct Session {
-    key: Arc<Vec<u8>>,
-    seen: Arc<Mutex<HashSet<Vec<u8>>>>,
-    session: Arc<String>,
-    username: Arc<String>,
-}
+pub struct Session { key: Arc<Vec<u8>>, seen: Arc<Mutex<HashSet<Vec<u8>>>>, session: Arc<String>, username: Arc<String> }
 
 impl Session {
     pub fn new(key: impl Into<Vec<u8>>, username: impl Into<String>) -> Self {
-        Self {
-            key: Arc::new(key.into()),
-            seen: Arc::new(Mutex::new(HashSet::new())),
-            session: Arc::new(uuid::Uuid::new_v4().to_string()),
-            username: Arc::new(username.into()),
-        }
+        Self { key: Arc::new(key.into()), seen: Arc::new(Mutex::new(HashSet::new())), session: Arc::new(uuid::Uuid::new_v4().to_string()),
+            username: Arc::new(username.into()) }
     }
 
     pub fn id(&self) -> &str { &self.session }
@@ -88,22 +67,15 @@ impl Session {
             let mut seen = self.seen.lock().expect("wire replay lock poisoned");
             if !seen.insert(signature.to_vec()) { return Err(WireError::DuplicateSignature); }
         }
-        Ok(Message {
-            identities: frames[..delimiter].to_vec(),
-            header: serde_json::from_slice(&json_parts[0])?,
-            parent_header: serde_json::from_slice(&json_parts[1])?,
-            metadata: serde_json::from_slice(&json_parts[2])?,
-            content: serde_json::from_slice(&json_parts[3])?,
-            buffers: frames[delimiter + 6..].to_vec(),
-        })
+        Ok(Message { identities: frames[..delimiter].to_vec(), header: serde_json::from_slice(&json_parts[0])?,
+            parent_header: serde_json::from_slice(&json_parts[1])?, metadata: serde_json::from_slice(&json_parts[2])?,
+            content: serde_json::from_slice(&json_parts[3])?, buffers: frames[delimiter + 6..].to_vec() })
     }
 
     pub fn encode(&self, message: &Message) -> Result<Vec<Bytes>, WireError> {
         let json_parts = [
-            Bytes::from(serde_json::to_vec(&message.header)?),
-            Bytes::from(serde_json::to_vec(&message.parent_header)?),
-            Bytes::from(serde_json::to_vec(&message.metadata)?),
-            Bytes::from(serde_json::to_vec(&message.content)?),
+            Bytes::from(serde_json::to_vec(&message.header)?), Bytes::from(serde_json::to_vec(&message.parent_header)?),
+            Bytes::from(serde_json::to_vec(&message.metadata)?), Bytes::from(serde_json::to_vec(&message.content)?),
         ];
         let mut frames = message.identities.clone();
         frames.push(Bytes::from_static(DELIMITER));
@@ -122,14 +94,8 @@ impl Session {
             "msg_type": msg_type,
             "version": "5.3",
         });
-        Message {
-            identities: vec![],
-            header: header.as_object().unwrap().clone(),
-            parent_header: parent.map(|message| message.header.clone()).unwrap_or_default(),
-            metadata: Map::new(),
-            content,
-            buffers: vec![],
-        }
+        Message { identities: vec![], header: header.as_object().unwrap().clone(),
+            parent_header: parent.map(|message| message.header.clone()).unwrap_or_default(), metadata: Map::new(), content, buffers: vec![] }
     }
 
     pub fn reply(&self, request: &Message, msg_type: &str, content: Value) -> Message { self.message(msg_type, content, Some(request)) }

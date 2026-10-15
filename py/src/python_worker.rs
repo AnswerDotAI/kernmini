@@ -4,9 +4,7 @@ use pyo3::prelude::*;
 
 struct PythonState(Option<Py<PyAny>>);
 
-impl Drop for PythonState {
-    fn drop(&mut self) { Python::attach(|_| drop(self.0.take())); }
-}
+impl Drop for PythonState { fn drop(&mut self) { Python::attach(|_| drop(self.0.take())); } }
 
 /// Async access to a synchronous interpreter created and used on one dedicated thread.
 #[pyclass(name = "ThreadWorker", module = "kernmini._native")]
@@ -22,8 +20,7 @@ impl PyThreadWorker {
         if let Some(size) = stack_size { builder = builder.stack_size(size); }
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let worker = ThreadWorker::start(builder, move || {
-                Python::attach(|py| context.call_method1(py, "run", (factory,)).map(|state| PythonState(Some(state))))
-                    .map_err(kernmini::Error::adapter)
+                Python::attach(|py| context.call_method1(py, "run", (factory,)).map(|state| PythonState(Some(state)))).map_err(kernmini::Error::adapter)
             }).await.map_err(py_error)?;
             Python::attach(|py| Py::new(py, Self { worker }))
         })
@@ -34,8 +31,7 @@ impl PyThreadWorker {
         let context = py.import("contextvars")?.call_method0("copy_context")?.unbind();
         let worker = self.worker.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            worker.call(move |state| Python::attach(|py| context.call_method1(py, "run", (callback, state.0.as_ref().unwrap()))))
-                .await.map_err(py_error)?
+            worker.call(move |state| Python::attach(|py| context.call_method1(py, "run", (callback, state.0.as_ref().unwrap())))).await.map_err(py_error)?
         })
     }
 

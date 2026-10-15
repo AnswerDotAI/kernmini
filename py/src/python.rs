@@ -22,20 +22,16 @@ pub(crate) fn py_error(error: Error) -> PyErr {
         source = cause.source();
     }
     let exception = match error.kind() {
-        ErrorKind::Interrupted => PyKeyboardInterrupt::new_err(error.to_string()),
-        ErrorKind::TimedOut => PyTimeoutError::new_err(error.to_string()),
+        ErrorKind::Interrupted => PyKeyboardInterrupt::new_err(error.to_string()), ErrorKind::TimedOut => PyTimeoutError::new_err(error.to_string()),
         ErrorKind::InvalidInput => PyValueError::new_err(error.to_string()),
         ErrorKind::Io => match errno { Some(errno) => PyOSError::new_err((errno, error.to_string())), None => PyOSError::new_err(error.to_string()) },
-        _ => KernelError::new_err(error.to_string()),
+        _ => KernelError::new_err(error.to_string())
     };
     Python::attach(|py| {
         let _ = exception.value(py).setattr("kind", format!("{:?}", error.kind()));
         let mut source = error.source();
         while let Some(cause) = source {
-            if let Some(cause) = cause.downcast_ref::<PyErr>() {
-                exception.set_cause(py, Some(cause.clone_ref(py)));
-                break;
-            }
+            if let Some(cause) = cause.downcast_ref::<PyErr>() { exception.set_cause(py, Some(cause.clone_ref(py))); break; }
             source = cause.source();
         }
     });
@@ -58,11 +54,7 @@ fn py_buffers(value: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<u8>>> {
 
 #[pyclass]
 struct ExecutionSink {
-    context: ExecutionContext,
-    target: Option<Py<PyAny>>,
-    locals: Option<pyo3_async_runtimes::TaskLocals>,
-    interrupted: Option<Arc<AtomicBool>>,
-    wake_sync: bool,
+    context: ExecutionContext, target: Option<Py<PyAny>>, locals: Option<pyo3_async_runtimes::TaskLocals>, interrupted: Option<Arc<AtomicBool>>, wake_sync: bool
 }
 
 #[pymethods]
@@ -73,14 +65,10 @@ impl ExecutionSink {
         let locals = locals.clone();
         let interrupted = interrupted.clone();
         let wake_sync = self.wake_sync;
-        self.context
-            .set_interrupt_handler(Arc::new(move || {
+        self.context.set_interrupt_handler(Arc::new(move || {
                 Python::attach(|py| -> PyResult<()> {
                     interrupted.store(true, AtomicOrdering::Release);
-                    if target.bind(py).hasattr("interrupt")? {
-                        target.call_method0(py, "interrupt")?;
-                        return Ok(());
-                    }
+                    if target.bind(py).hasattr("interrupt")? { target.call_method0(py, "interrupt")?; return Ok(()); }
                     let sync_thread = if target.bind(py).hasattr("_sync_thread_id")? { target.getattr(py, "_sync_thread_id")? } else { py.None() };
                     if !sync_thread.is_none(py) {
                         let thread_id: libc::c_ulong = sync_thread.extract(py)?;
@@ -98,8 +86,7 @@ impl ExecutionSink {
                     let cancel = task.getattr(py, "cancel")?;
                     locals.event_loop(py).call_method1("call_soon_threadsafe", (cancel,))?;
                     Ok(())
-                })
-                .map_err(Error::adapter)
+                }).map_err(Error::adapter)
             }))
             .map_err(py_error)
     }
@@ -119,22 +106,11 @@ impl ExecutionSink {
     fn parent(&self, py: Python<'_>) -> PyResult<Py<PyAny>> { json_to_py(py, &self.context.parent()) }
 
     fn publish(
-        &self,
-        py: Python<'_>,
-        msg_type: String,
-        content: &Bound<'_, PyAny>,
-        metadata: &Bound<'_, PyAny>,
-        identity: &Bound<'_, PyAny>,
-        buffers: &Bound<'_, PyAny>,
-    ) -> PyResult<()> {
+        &self, py: Python<'_>, msg_type: String, content: &Bound<'_, PyAny>, metadata: &Bound<'_, PyAny>, identity: &Bound<'_, PyAny>,
+        buffers: &Bound<'_, PyAny>) -> PyResult<()> {
         let identity = if identity.is_none() { None } else { Some(identity.cast::<PyBytes>()?.as_bytes().to_vec()) };
-        let event = LanguageEvent::Message {
-            msg_type,
-            content: py_to_json(py, content)?,
-            metadata: py_to_json(py, metadata)?,
-            identity,
-            buffers: py_buffers(buffers)?,
-        };
+        let event = LanguageEvent::Message { msg_type, content: py_to_json(py, content)?, metadata: py_to_json(py, metadata)?, identity,
+            buffers: py_buffers(buffers)? };
         py.detach(|| self.context.emit_blocking(event)).map_err(py_error)
     }
 
@@ -164,10 +140,8 @@ struct SignalRouter { interrupt: KernelInterrupter, target: Py<PyAny> }
 #[pymethods]
 impl SignalRouter {
     fn __call__(&self, py: Python<'_>, _signum: i32, _frame: Py<PyAny>) -> PyResult<()> {
-        if !self.target.bind(py).hasattr("interrupt")?
-            && self.target.bind(py).hasattr("_sync_thread_id")?
-            && !self.target.getattr(py, "_sync_thread_id")?.is_none(py)
-        { return Err(PyKeyboardInterrupt::new_err("")); }
+        if !self.target.bind(py).hasattr("interrupt")? && self.target.bind(py).hasattr("_sync_thread_id")?
+            && !self.target.getattr(py, "_sync_thread_id")?.is_none(py) { return Err(PyKeyboardInterrupt::new_err("")); }
         self.interrupt.interrupt();
         Ok(())
     }
@@ -177,7 +151,9 @@ impl SignalRouter {
 struct DebugRouter { sender: DebugEventSender }
 
 #[pymethods]
-impl DebugRouter { fn __call__(&self, py: Python<'_>, event: &Bound<'_, PyAny>) -> PyResult<()> { (self.sender)(py_to_json(py, event)?); Ok(()) } }
+impl DebugRouter {
+    fn __call__(&self, py: Python<'_>, event: &Bound<'_, PyAny>) -> PyResult<()> { (self.sender)(py_to_json(py, event)?); Ok(()) }
+}
 
 struct ChildLoop { event_loop: Mutex<Option<Py<PyAny>>>, thread: Mutex<Option<JoinHandle<()>>> }
 
@@ -186,7 +162,9 @@ impl ChildLoop {
 
     fn stop(&self) {
         let Some(event_loop) = self.event_loop.lock().expect("child loop lock poisoned").take() else { return };
-        Python::attach(|py| { if let Ok(stop) = event_loop.getattr(py, "stop") { let _ = event_loop.call_method1(py, "call_soon_threadsafe", (stop,)); } });
+        Python::attach(|py| {
+            if let Ok(stop) = event_loop.getattr(py, "stop") { let _ = event_loop.call_method1(py, "call_soon_threadsafe", (stop,)); }
+        });
     }
 
     async fn shutdown(&self) -> kernmini::Result<()> {
@@ -203,25 +181,17 @@ impl ChildLoop {
 impl Drop for ChildLoop {
     fn drop(&mut self) {
         self.stop();
-        if let Some(thread) = self.thread.lock().expect("child thread lock poisoned").take()
-            && thread.thread().id() != std::thread::current().id()
-        { std::thread::spawn(move || { let _ = thread.join(); }); }
+        if let Some(thread) = self.thread.lock().expect("child thread lock poisoned").take() && thread.thread().id() != std::thread::current().id() {
+            std::thread::spawn(move || { let _ = thread.join(); });
+        }
     }
 }
 
-struct PyLanguageSession {
-    target: Py<PyAny>,
-    locals: pyo3_async_runtimes::TaskLocals,
-    _child_loop: Option<Arc<ChildLoop>>,
-}
+struct PyLanguageSession { target: Py<PyAny>, locals: pyo3_async_runtimes::TaskLocals, _child_loop: Option<Arc<ChildLoop>> }
 
 impl Clone for PyLanguageSession {
     fn clone(&self) -> Self {
-        Python::attach(|py| Self {
-            target: self.target.clone_ref(py),
-            locals: self.locals.clone(),
-            _child_loop: self._child_loop.clone(),
-        })
+        Python::attach(|py| Self { target: self.target.clone_ref(py), locals: self.locals.clone(), _child_loop: self._child_loop.clone() })
     }
 }
 
@@ -243,8 +213,7 @@ impl PyLanguageSession {
             let bridge = py.import("kernmini._bridge")?;
             let awaitable = bridge.call_method1("request", (target, method, json_to_py(py, &content)?))?;
             pyo3_async_runtimes::into_future_with_locals(&locals, awaitable)
-        })
-        .map_err(Error::adapter)?;
+        }).map_err(Error::adapter)?;
         let result = future.await.map_err(Error::adapter)?;
         Python::attach(|py| if result.is_none(py) { Ok(None) } else { py_to_json(py, result.bind(py)).map(Some) }).map_err(Error::adapter)
     }
@@ -262,9 +231,7 @@ impl ChildReady {
         *child_loop.event_loop.lock().expect("child loop lock poisoned") = Some(event_loop.clone_ref(py));
         let locals = pyo3_async_runtimes::TaskLocals::new(event_loop.bind(py).clone()).copy_context(py)?;
         let session = PyLanguageSession::with_locals(py, target, locals, Some(child_loop))?;
-        if self.created.lock().expect("child startup lock poisoned").take().unwrap().send(Ok(session)).is_err() {
-            event_loop.call_method0(py, "stop")?;
-        }
+        if self.created.lock().expect("child startup lock poisoned").take().unwrap().send(Ok(session)).is_err() { event_loop.call_method0(py, "stop")?; }
         Ok(())
     }
 }
@@ -292,9 +259,9 @@ impl Language for PyLanguage {
                 py.import("kernmini._bridge")?.call_method1("run_child_loop", (factory, loop_factory, ready))?;
                 Ok(())
             });
-            if let Err(error) = outcome
-                && let Some(created) = created.lock().expect("child startup lock poisoned").take()
-            { let _ = created.send(Err(Error::adapter(error))); }
+            if let Err(error) = outcome && let Some(created) = created.lock().expect("child startup lock poisoned").take() {
+                let _ = created.send(Err(Error::adapter(error)));
+            }
         });
         *child_loop.thread.lock().expect("child thread lock poisoned") = Some(thread);
         result.await.map_err(|error| Error::closed("child Python session during startup").caused_by(error))?
@@ -306,14 +273,10 @@ impl LanguageSession for PyLanguageSession {
     fn kernel_info(&self) -> kernmini::Result<KernelInfo> {
         Python::attach(|py| -> PyResult<KernelInfo> {
             let value = py_to_json(py, self.target.call_method0(py, "kernel_info")?.bind(py))?;
-            Ok(KernelInfo {
-                implementation: value["implementation"].as_str().unwrap_or("python").to_owned(),
+            Ok(KernelInfo { implementation: value["implementation"].as_str().unwrap_or("python").to_owned(),
                 implementation_version: value["implementation_version"].as_str().unwrap_or("0").to_owned(),
-                banner: value["banner"].as_str().unwrap_or("").to_owned(),
-                language_info: value.get("language_info").cloned().unwrap_or_else(|| json!({})),
-            })
-        })
-        .map_err(Error::adapter)
+                banner: value["banner"].as_str().unwrap_or("").to_owned(), language_info: value.get("language_info").cloned().unwrap_or_else(|| json!({})) })
+        }).map_err(Error::adapter)
     }
 
     fn supports_debugger(&self) -> bool { Python::attach(|py| self.target.bind(py).hasattr("debug_request")).unwrap_or(false) }
@@ -324,8 +287,7 @@ impl LanguageSession for PyLanguageSession {
                 self.target.getattr(py, "debugger")?.setattr(py, "event_callback", Py::new(py, DebugRouter { sender })?)?;
             }
             Ok(())
-        })
-        .map_err(Error::adapter)
+        }).map_err(Error::adapter)
     }
 
     async fn execute(&self, request: ExecuteRequest, context: ExecutionContext) -> kernmini::Result<ExecuteOutcome> {
@@ -334,15 +296,8 @@ impl LanguageSession for PyLanguageSession {
         let interrupted = Arc::new(AtomicBool::new(false));
         let future = Python::attach(|py| -> PyResult<_> {
             let sink = Py::new(
-                py,
-                ExecutionSink {
-                    context: context.clone(),
-                    target: Some(target.clone_ref(py)),
-                    locals: Some(locals.clone()),
-                    interrupted: Some(interrupted.clone()),
-                    wake_sync: self._child_loop.is_none(),
-                },
-            )?;
+                py, ExecutionSink { context: context.clone(), target: Some(target.clone_ref(py)), locals: Some(locals.clone()),
+                    interrupted: Some(interrupted.clone()), wake_sync: self._child_loop.is_none() })?;
             let kwargs = PyDict::new(py);
             kwargs.set_item("silent", request.silent)?;
             kwargs.set_item("store_history", request.store_history)?;
@@ -352,40 +307,30 @@ impl LanguageSession for PyLanguageSession {
             let bridge = py.import("kernmini._bridge")?;
             let awaitable = bridge.call_method("execute", (target, sink, request.code), Some(&kwargs))?;
             pyo3_async_runtimes::into_future_with_locals(&locals, awaitable)
-        })
-        .map_err(Error::adapter)?;
+        }).map_err(Error::adapter)?;
 
         let result = future.await;
         let value = Python::attach(|py| -> PyResult<Value> { py_to_json(py, result?.bind(py)) }).map_err(Error::adapter)?;
 
         if let Some(streams) = value.get("streams").and_then(Value::as_array) {
             for stream in streams {
-                context
-                    .emit(LanguageEvent::Stream {
-                        name: stream["name"].as_str().unwrap_or("stdout").into(),
-                        text: stream["text"].as_str().unwrap_or("").into(),
-                    })
-                    .await?;
+                context.emit(LanguageEvent::Stream { name: stream["name"].as_str().unwrap_or("stdout").into(),
+                        text: stream["text"].as_str().unwrap_or("").into() }).await?;
             }
         }
         if let Some(displays) = value.get("display").and_then(Value::as_array) {
             for display in displays { context.emit(LanguageEvent::Display { event: display.clone(), buffers: vec![] }).await?; }
         }
         let mut error = value.get("error").filter(|error| !error.is_null()).map(|error| LanguageError {
-            ename: error["ename"].as_str().unwrap_or("Error").to_owned(),
-            evalue: error["evalue"].as_str().unwrap_or("").to_owned(),
-            traceback: error["traceback"].as_array().map(|lines| lines.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default(),
-        });
+            ename: error["ename"].as_str().unwrap_or("Error").to_owned(), evalue: error["evalue"].as_str().unwrap_or("").to_owned(),
+            traceback: error["traceback"].as_array().map(|lines| lines.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default() });
         if interrupted.load(AtomicOrdering::Acquire) && error.as_ref().is_some_and(|error| error.ename == "CancelledError") {
             error = Some(LanguageError { ename: "KeyboardInterrupt".into(), evalue: "".into(), traceback: vec![] });
         }
-        Ok(ExecuteOutcome {
-            result: value.get("result").filter(|result| !result.is_null()).cloned(),
-            result_metadata: value.get("result_metadata").cloned().unwrap_or_else(|| json!({})),
-            error,
+        Ok(ExecuteOutcome { result: value.get("result").filter(|result| !result.is_null()).cloned(),
+            result_metadata: value.get("result_metadata").cloned().unwrap_or_else(|| json!({})), error,
             user_expressions: value.get("user_expressions").cloned().unwrap_or_else(|| json!({})),
-            payload: value.get("payload").cloned().unwrap_or_else(|| json!([])),
-        })
+            payload: value.get("payload").cloned().unwrap_or_else(|| json!([])) })
     }
 
     async fn complete(&self, request: CompleteRequest) -> kernmini::Result<Value> {
@@ -398,11 +343,15 @@ impl LanguageSession for PyLanguageSession {
             .unwrap_or_else(reply_defaults::inspect))
     }
 
-    async fn is_complete(&self, code: String) -> kernmini::Result<Value> { Ok(self.request("is_complete", json!({"code": code})).await?.unwrap_or_else(reply_defaults::is_complete)) }
+    async fn is_complete(&self, code: String) -> kernmini::Result<Value> {
+        Ok(self.request("is_complete", json!({"code": code})).await?.unwrap_or_else(reply_defaults::is_complete))
+    }
 
     async fn history(&self, request: Value) -> kernmini::Result<Value> { Ok(self.request("history", request).await?.unwrap_or_else(reply_defaults::history)) }
 
-    async fn comm_info(&self, request: Value) -> kernmini::Result<Value> { Ok(self.request("comm_info", request).await?.unwrap_or_else(reply_defaults::comm_info)) }
+    async fn comm_info(&self, request: Value) -> kernmini::Result<Value> {
+        Ok(self.request("comm_info", request).await?.unwrap_or_else(reply_defaults::comm_info))
+    }
 
     async fn debug(&self, request: Value) -> kernmini::Result<Value> {
         if !self.supports_debugger() { return Ok(reply_defaults::debug()); }
@@ -412,9 +361,7 @@ impl LanguageSession for PyLanguageSession {
                 let request = json_to_py(py, &request)?;
                 py_to_json(py, target.call_method1(py, "debug_request", (request,))?.bind(py))
             })
-        })
-        .await?
-        .map_err(Error::adapter)
+        }).await?.map_err(Error::adapter)
     }
 
     async fn message(&self, message: LanguageMessage, context: ExecutionContext) -> kernmini::Result<()> {
@@ -426,8 +373,7 @@ impl LanguageSession for PyLanguageSession {
             let bridge = py.import("kernmini._bridge")?;
             let awaitable = bridge.call_method1("message", (target, sink, message.msg_type, json_to_py(py, &message.content)?, buffers))?;
             pyo3_async_runtimes::into_future_with_locals(&locals, awaitable)
-        })
-        .map_err(Error::adapter)?;
+        }).map_err(Error::adapter)?;
         future.await.map_err(Error::adapter)?;
         Ok(())
     }
@@ -446,13 +392,7 @@ impl LanguageSession for PyLanguageSession {
 #[pyfunction]
 #[pyo3(signature = (connection_file, target, factory, loop_factory, owns_process_group, parent_pid))]
 fn run_kernel<'py>(
-    py: Python<'py>,
-    connection_file: String,
-    target: Py<PyAny>,
-    factory: Py<PyAny>,
-    loop_factory: Py<PyAny>,
-    owns_process_group: bool,
-    parent_pid: i32,
+    py: Python<'py>, connection_file: String, target: Py<PyAny>, factory: Py<PyAny>, loop_factory: Py<PyAny>, owns_process_group: bool, parent_pid: i32
 ) -> PyResult<Bound<'py, PyAny>> {
     let interrupt = KernelInterrupter::default();
     let signal = py.import("signal")?;
@@ -491,15 +431,8 @@ fn run_kernel<'py>(
 #[pyo3(signature = (name, argv, display_name, language, user=true, prefix=None, **spec_kw))]
 #[allow(clippy::too_many_arguments)]
 fn install_kernelspec(
-    py: Python<'_>,
-    name: &str,
-    argv: Vec<String>,
-    display_name: &str,
-    language: &str,
-    user: bool,
-    prefix: Option<std::path::PathBuf>,
-    spec_kw: Option<&Bound<'_, PyDict>>,
-) -> PyResult<std::path::PathBuf> {
+    py: Python<'_>, name: &str, argv: Vec<String>, display_name: &str, language: &str, user: bool, prefix: Option<std::path::PathBuf>,
+    spec_kw: Option<&Bound<'_, PyDict>>) -> PyResult<std::path::PathBuf> {
     let _ = user; // Kept for compatibility: installs go under `prefix`, or else to the user data directory.
     let extra = match spec_kw.map(|kw| py_to_json(py, kw.as_any())).transpose()? { Some(Value::Object(map)) => map, _ => serde_json::Map::new() };
     kernmini::install_kernelspec(name, &argv, display_name, language, extra, prefix.as_deref()).map_err(py_error)

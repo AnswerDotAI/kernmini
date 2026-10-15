@@ -7,12 +7,8 @@ struct EchoSession;
 #[async_trait::async_trait]
 impl LanguageSession for EchoSession {
     fn kernel_info(&self) -> kernmini::Result<KernelInfo> {
-        Ok(KernelInfo {
-            implementation: "echokernel".into(),
-            implementation_version: "0.0.1".into(),
-            banner: "echo".into(),
-            language_info: json!({"name": "echo", "version": "1.0", "mimetype": "text/plain", "file_extension": ".txt"}),
-        })
+        Ok(KernelInfo { implementation: "echokernel".into(), implementation_version: "0.0.1".into(), banner: "echo".into(),
+            language_info: json!({"name": "echo", "version": "1.0", "mimetype": "text/plain", "file_extension": ".txt"}) })
     }
 
     async fn execute(&self, request: ExecuteRequest, context: ExecutionContext) -> kernmini::Result<ExecuteOutcome> {

@@ -3,16 +3,8 @@ use std::path::Path;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ConnectionInfo {
-    pub transport: String,
-    pub ip: String,
-    pub shell_port: u16,
-    pub iopub_port: u16,
-    pub stdin_port: u16,
-    pub control_port: u16,
-    pub hb_port: u16,
-    #[serde(default)]
-    pub key: String,
-    pub signature_scheme: String,
+    pub transport: String, pub ip: String, pub shell_port: u16, pub iopub_port: u16, pub stdin_port: u16, pub control_port: u16, pub hb_port: u16,
+    #[serde(default)] pub key: String, pub signature_scheme: String
 }
 
 impl ConnectionInfo {

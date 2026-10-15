@@ -11,24 +11,14 @@ fn execution_interrupt_story() {
     assert!(interrupt.requested());
 
     let called = calls.clone();
-    interrupt
-        .set_handler(Arc::new(move || {
-            called.fetch_add(1, Ordering::AcqRel);
-            Ok(())
-        }))
-        .unwrap();
+    interrupt.set_handler(Arc::new(move || { called.fetch_add(1, Ordering::AcqRel); Ok(()) })).unwrap();
     assert_eq!(calls.load(Ordering::Acquire), 1);
     assert!(!interrupt.request().unwrap());
     assert_eq!(calls.load(Ordering::Acquire), 1);
 
     let ready = ExecutionInterrupt::default();
     let called = calls.clone();
-    ready
-        .set_handler(Arc::new(move || {
-            called.fetch_add(1, Ordering::AcqRel);
-            Ok(())
-        }))
-        .unwrap();
+    ready.set_handler(Arc::new(move || { called.fetch_add(1, Ordering::AcqRel); Ok(()) })).unwrap();
     assert!(ready.request().unwrap());
     assert_eq!(calls.load(Ordering::Acquire), 2);
     assert_eq!(ready.set_handler(Arc::new(|| Ok(()))).unwrap_err().kind(), ErrorKind::InvalidInput);

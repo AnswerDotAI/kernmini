@@ -41,11 +41,8 @@ struct KernelConfig { iopub_capacity: usize, hold_timeout: Duration }
 impl KernelConfig {
     fn from_env() -> Self {
         let iopub_capacity = std::env::var("KERNMINI_IOPUB_QMAX").ok().and_then(|value| value.parse().ok()).unwrap_or(10_000).max(1);
-        let hold_seconds = std::env::var("KERNMINI_HOLD_TIMEOUT")
-            .ok()
-            .and_then(|value| value.parse::<f64>().ok())
-            .filter(|value| value.is_finite() && *value >= 0.0)
-            .unwrap_or(3600.0);
+        let hold_seconds = std::env::var("KERNMINI_HOLD_TIMEOUT").ok().and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0).unwrap_or(3600.0);
         Self { iopub_capacity, hold_timeout: Duration::from_secs_f64(hold_seconds) }
     }
 }
@@ -85,7 +82,8 @@ impl Stdin {
                 let parent = inbound.message.parent_header.get("msg_id").and_then(Value::as_str).unwrap_or("");
                 let value = inbound.message.content.get("value").and_then(Value::as_str).unwrap_or("").to_owned();
                 let mut replies = replies.lock().await;
-                let key = if replies.contains_key(parent) { Some(parent.to_owned()) } else { replies.iter().find(|(_, pending)| pending.identity == inbound.identity).map(|(key, _)| key.clone()) };
+                let key = if replies.contains_key(parent) { Some(parent.to_owned()) }
+                else { replies.iter().find(|(_, pending)| pending.identity == inbound.identity).map(|(key, _)| key.clone()) };
                 if let Some(pending) = key.and_then(|key| replies.remove(&key)) { let _ = pending.complete.send(Ok(value)); }
             }
             Err(Error::closed("stdin router"))
@@ -122,7 +120,8 @@ impl Stdin {
 struct ShellServices<L> { language: L, shared: KernelServices }
 
 impl KernelServices {
-    fn output_context(&self, request: &Message, identity: Option<Bytes>, silent: bool, interrupt: ExecutionInterrupt, execution_count: u64) -> ExecutionContext {
+    fn output_context(
+        &self, request: &Message, identity: Option<Bytes>, silent: bool, interrupt: ExecutionInterrupt, execution_count: u64) -> ExecutionContext {
         let (events, mut output) = event_channel(self.config.iopub_capacity);
         let execution = identity.is_some();
         let client_session = request.header.get("session").and_then(Value::as_str).unwrap_or("").to_owned();
@@ -151,12 +150,8 @@ impl KernelServices {
                             }
                         }
                         match message {
-                            ContextMessage::Event(event) => {
-                                publish_event(&iopub, &session, &request, event, silent).await?;
-                            }
-                            ContextMessage::Flush(complete) => {
-                                let _ = complete.send(());
-                            }
+                            ContextMessage::Event(event) => { publish_event(&iopub, &session, &request, event, silent).await?; }
+                            ContextMessage::Flush(complete) => { let _ = complete.send(()); }
                             ContextMessage::Input { prompt, password, complete } => {
                                 let result = if let Some((stdin, identity)) = &stdin {
                                     stdin.request(identity, &request, prompt, password, &interrupt).await
@@ -179,22 +174,17 @@ impl KernelServices {
 
 async fn publish_event(iopub: &Iopub, session: &Session, request: &Message, event: LanguageEvent, silent: bool) -> crate::Result<()> {
     match event {
-        LanguageEvent::Stream { name, text } if !silent => {
-            send_iopub(iopub, session, request, "stream", json!({"name": name, "text": text})).await?;
-        }
+        LanguageEvent::Stream { name, text } if !silent => { send_iopub(iopub, session, request, "stream", json!({"name": name, "text": text})).await?; }
         LanguageEvent::Display { event, buffers } if !silent => {
             let (msg_type, content) = if event.get("type").and_then(Value::as_str) == Some("clear_output") {
                 ("clear_output", json!({"wait": event.get("wait").and_then(Value::as_bool).unwrap_or(false)}))
             } else {
                 let msg_type = if event.get("update").and_then(Value::as_bool).unwrap_or(false) { "update_display_data" } else { "display_data" };
-                (
-                    msg_type,
-                    json!({
-                        "data": event.get("data").cloned().unwrap_or_else(|| json!({})),
-                        "metadata": event.get("metadata").cloned().unwrap_or_else(|| json!({})),
-                        "transient": event.get("transient").cloned().unwrap_or_else(|| json!({})),
-                    }),
-                )
+                (msg_type, json!({
+                    "data": event.get("data").cloned().unwrap_or_else(|| json!({})),
+                    "metadata": event.get("metadata").cloned().unwrap_or_else(|| json!({})),
+                    "transient": event.get("transient").cloned().unwrap_or_else(|| json!({})),
+                }))
             };
             let mut message = session.message(msg_type, content, Some(request));
             message.buffers = buffers.into_iter().map(Bytes::from).collect();
@@ -214,29 +204,19 @@ async fn publish_event(iopub: &Iopub, session: &Session, request: &Message, even
 
 fn missing_fields(request: &Message) -> Vec<&'static str> {
     let required: &[&str] = match request.msg_type() {
-        "execute_request" | "is_complete_request" => &["code"],
-        "complete_request" | "inspect_request" => &["code", "cursor_pos"],
-        "history_request" => &["hist_access_type"],
-        _ => &[],
+        "execute_request" | "is_complete_request" => &["code"], "complete_request" | "inspect_request" => &["code", "cursor_pos"],
+        "history_request" => &["hist_access_type"], _ => &[]
     };
     required.iter().copied().filter(|key| request.content.get(*key).is_none()).collect()
 }
 
 async fn reply_missing(
-    execution_count: u64,
-    iopub: &Iopub,
-    session: &Session,
-    request: &Message,
-    reply: &crate::transport::ReplySink,
-    missing: &[&str],
-) -> crate::Result<()> {
+    execution_count: u64, iopub: &Iopub, session: &Session, request: &Message, reply: &crate::transport::ReplySink, missing: &[&str]) -> crate::Result<()> {
     let content = error_content(request, execution_count, "MissingField", format!("missing required fields: {}", missing.join(", ")));
     reply_error(iopub, session, request, reply, content).await
 }
 
-async fn reply_error(
-    iopub: &Iopub, session: &Session, request: &Message, reply: &crate::transport::ReplySink, content: Value,
-) -> crate::Result<()> {
+async fn reply_error(iopub: &Iopub, session: &Session, request: &Message, reply: &crate::transport::ReplySink, content: Value) -> crate::Result<()> {
     if request.msg_type() == "execute_request" {
         status(iopub, session, request, "busy").await?;
         send_iopub(iopub, session, request, "error", content.clone()).await?;
@@ -253,41 +233,31 @@ fn error_content(request: &Message, execution_count: u64, ename: &str, evalue: S
         content["execution_count"] = json!(execution_count);
         content["user_expressions"] = json!({});
         content["payload"] = json!([]);
-    }
-    else if request.msg_type() == "complete_request" {
+    } else if request.msg_type() == "complete_request" {
         content["matches"] = json!([]);
         content["cursor_start"] = json!(0);
         content["cursor_end"] = json!(0);
         content["metadata"] = json!({});
-    }
-    else if request.msg_type() == "inspect_request" {
+    } else if request.msg_type() == "inspect_request" {
         content["found"] = json!(false);
         content["data"] = json!({});
         content["metadata"] = json!({});
-    }
-    else if request.msg_type() == "history_request" { content["history"] = json!([]); }
+    } else if request.msg_type() == "history_request" { content["history"] = json!([]); }
     else if request.msg_type() == "is_complete_request" { content["indent"] = json!(""); }
     content
 }
 
 /// The execute request in `content`, with the protocol's defaults for missing fields.
 fn execute_request(content: &Value) -> ExecuteRequest {
-    ExecuteRequest {
-        code: content.get("code").and_then(Value::as_str).unwrap_or("").to_owned(),
+    ExecuteRequest { code: content.get("code").and_then(Value::as_str).unwrap_or("").to_owned(),
         silent: content.get("silent").and_then(Value::as_bool).unwrap_or(false),
         store_history: content.get("store_history").and_then(Value::as_bool).unwrap_or(true),
         user_expressions: content.get("user_expressions").cloned().unwrap_or_else(|| json!({})),
-        allow_stdin: content.get("allow_stdin").and_then(Value::as_bool).unwrap_or(true),
-    }
+        allow_stdin: content.get("allow_stdin").and_then(Value::as_bool).unwrap_or(true) }
 }
 async fn execute(
-    services: &ShellServices<impl LanguageSession>,
-    identity: Bytes,
-    request: &Message,
-    execute: ExecuteRequest,
-    execution_count: u64,
-    interrupt: ExecutionInterrupt,
-) -> crate::Result<(Value, bool)> {
+    services: &ShellServices<impl LanguageSession>, identity: Bytes, request: &Message, execute: ExecuteRequest, execution_count: u64,
+    interrupt: ExecutionInterrupt) -> crate::Result<(Value, bool)> {
     let language = &services.language;
     let iopub = &services.shared.iopub;
     let session = &services.shared.session;
@@ -313,17 +283,10 @@ async fn execute(
         })
     } else {
         if !silent && let Some(result) = outcome.result {
-            send_iopub(
-                iopub,
-                session,
-                request,
-                "execute_result",
-                json!({
-                    "execution_count": execution_count,
-                    "data": result, "metadata": outcome.result_metadata,
-                }),
-            )
-            .await?;
+            send_iopub(iopub, session, request, "execute_result", json!({
+                "execution_count": execution_count,
+                "data": result, "metadata": outcome.result_metadata,
+            })).await?;
         }
         json!({
             "status": "ok", "execution_count": execution_count,
@@ -392,16 +355,16 @@ async fn handle_shell(services: &ShellServices<impl LanguageSession>, inbound: I
                         "banner": info.banner, "language_info": info.language_info,
                         "help_links": [], "debugger": debugger, "supported_features": features,
                     })
-                },
-                "complete_request" => language.complete(CompleteRequest {
-                    code: request.content.get("code").and_then(Value::as_str).unwrap_or("").to_owned(),
-                    cursor_pos: request.content.get("cursor_pos").and_then(Value::as_u64).unwrap_or(0),
-                }).await?,
-                "inspect_request" => language.inspect(InspectRequest {
-                    code: request.content.get("code").and_then(Value::as_str).unwrap_or("").to_owned(),
-                    cursor_pos: request.content.get("cursor_pos").and_then(Value::as_u64).unwrap_or(0),
-                    detail_level: request.content.get("detail_level").and_then(Value::as_u64).unwrap_or(0),
-                }).await?,
+                }
+                "complete_request" => {
+                    language.complete(CompleteRequest { code: request.content.get("code").and_then(Value::as_str).unwrap_or("").to_owned(),
+                            cursor_pos: request.content.get("cursor_pos").and_then(Value::as_u64).unwrap_or(0) }).await?
+                }
+                "inspect_request" => {
+                    language.inspect(InspectRequest { code: request.content.get("code").and_then(Value::as_str).unwrap_or("").to_owned(),
+                            cursor_pos: request.content.get("cursor_pos").and_then(Value::as_u64).unwrap_or(0),
+                            detail_level: request.content.get("detail_level").and_then(Value::as_u64).unwrap_or(0) }).await?
+                }
                 "is_complete_request" => language.is_complete(request.content.get("code").and_then(Value::as_str).unwrap_or("").to_owned()).await?,
                 "history_request" => language.history(request.content.clone()).await?,
                 _ => unreachable!(),
@@ -421,16 +384,9 @@ async fn handle_shell(services: &ShellServices<impl LanguageSession>, inbound: I
         }
         "comm_open" | "comm_msg" | "comm_close" => {
             let output = services.shared.output_context(&request, None, false, ExecutionInterrupt::default(), execution_count);
-            language
-                .message(
-                    LanguageMessage {
-                        msg_type: request.msg_type().to_owned(),
-                        content: request.content.clone(),
-                        buffers: request.buffers.iter().map(|buffer| buffer.to_vec()).collect(),
-                    },
-                    output.clone(),
-                )
-                .await?;
+            language.message(
+                    LanguageMessage { msg_type: request.msg_type().to_owned(), content: request.content.clone(),
+                        buffers: request.buffers.iter().map(|buffer| buffer.to_vec()).collect() }, output.clone()).await?;
             output.flush().await?;
             Ok(ShellOutcome::Continue)
         }
@@ -444,11 +400,7 @@ async fn handle_shell(services: &ShellServices<impl LanguageSession>, inbound: I
 }
 
 async fn run_execution(
-    services: ShellServices<impl LanguageSession>,
-    inbound: Inbound,
-    execution: ExecuteRequest,
-    execution_count: u64,
-    interrupt: ExecutionInterrupt,
+    services: ShellServices<impl LanguageSession>, inbound: Inbound, execution: ExecuteRequest, execution_count: u64, interrupt: ExecutionInterrupt
 ) -> crate::Result<ExecutionDone> {
     let request = inbound.message;
     let stop_on_error = request.content.get("stop_on_error").and_then(Value::as_bool).unwrap_or(true);
@@ -466,19 +418,14 @@ async fn run_execution(
 }
 
 async fn report_failure(
-    services: &ShellServices<impl LanguageSession>,
-    request: &Message,
-    reply: &crate::transport::ReplySink,
-    error: &Error,
-    execution_count: u64,
+    services: &ShellServices<impl LanguageSession>, request: &Message, reply: &crate::transport::ReplySink, error: &Error, execution_count: u64
 ) -> crate::Result<()> {
     let ename = if error.kind() == ErrorKind::Interrupted { "KeyboardInterrupt" } else { "KernelError" };
     let content = error_content(request, execution_count, ename, error.to_string());
     if request.msg_type() == "execute_request" { send_iopub(&services.shared.iopub, &services.shared.session, request, "error", content.clone()).await?; }
     if request.msg_type().ends_with("_request") {
         send_reply(reply, &services.shared.session, request, &request.msg_type().replace("_request", "_reply"), content).await?;
-    }
-    else { eprintln!("{} failed: {error}", request.msg_type()); }
+    } else { eprintln!("{} failed: {error}", request.msg_type()); }
     status(&services.shared.iopub, &services.shared.session, request, "idle").await
 }
 
@@ -521,8 +468,7 @@ async fn finish_hold(execution_count: u64, iopub: &Iopub, session: &Session, ite
     let error = match release_status {
         "error" => Some(json!({"ename": "HoldError", "evalue": "released with status error", "traceback": []})),
         "interrupt" => Some(json!({"ename": "KeyboardInterrupt", "evalue": "", "traceback": []})),
-        "timeout" => Some(json!({"ename": "HoldTimeout", "evalue": "held execution timed out", "traceback": []})),
-        _ => None,
+        "timeout" => Some(json!({"ename": "HoldTimeout", "evalue": "held execution timed out", "traceback": []})), _ => None
     };
     let failed = error.is_some();
     let content = if let Some(error) = error {
@@ -567,8 +513,7 @@ struct Shell<L: LanguageSession> {
     active: Option<ActiveExecution>,
     stopping: bool,
     interrupting: bool,
-    /// The count of the next execution that stores history. As in IPython, it starts at 1, and every other request reports it without
-    /// advancing it.
+    /// The count of the last execution that stored history, 0 before the first. As in IPython, every other request reports it.
     execution_count: u64,
 }
 
@@ -579,11 +524,10 @@ impl<L: LanguageSession> Shell<L> {
         self.order += 1;
     }
 
-    /// The execution count for `execute`. An execution that stores history takes the count and advances it.
+    /// The execution count to report for `execute`. An execution that stores history advances the count first.
     fn count_execution(&mut self, execute: &ExecuteRequest) -> u64 {
-        let count = self.execution_count;
         if execute.store_history && !execute.silent { self.execution_count += 1 }
-        count
+        self.execution_count
     }
 
     async fn abort_pending(&mut self) -> crate::Result<()> {
@@ -604,12 +548,7 @@ impl<L: LanguageSession> Shell<L> {
                 let found = self.held.as_ref().is_some_and(|held| held.item.inbound.message.msg_id() == msg_id);
                 if found {
                     let failed = finish_hold(
-                        self.execution_count,
-                        &self.services.shared.iopub,
-                        &self.services.shared.session,
-                        self.held.take().unwrap().item,
-                        &release_status,
-                    )
+                        self.execution_count, &self.services.shared.iopub, &self.services.shared.session, self.held.take().unwrap().item, &release_status)
                     .await?;
                     if failed { self.abort_pending().await? }
                 }
@@ -653,21 +592,12 @@ impl<L: LanguageSession> Shell<L> {
         let missing = missing_fields(&item.inbound.message);
         if !missing.is_empty() {
             reply_missing(
-                self.execution_count,
-                &self.services.shared.iopub,
-                &self.services.shared.session,
-                &item.inbound.message,
-                &item.inbound.reply,
-                &missing,
-            )
-            .await?;
+                self.execution_count, &self.services.shared.iopub, &self.services.shared.session, &item.inbound.message, &item.inbound.reply, &missing).await?;
             self.abort_pending().await?;
-        }
-        else if item.inbound.message.metadata.get("hold").and_then(Value::as_bool).unwrap_or(false) {
+        } else if item.inbound.message.metadata.get("hold").and_then(Value::as_bool).unwrap_or(false) {
             begin_hold(self.execution_count, &self.services.shared.iopub, &self.services.shared.session, &item).await?;
             self.held = Some(Held { item, deadline: tokio::time::Instant::now() + self.services.shared.config.hold_timeout });
-        }
-        else {
+        } else {
             let interrupt = ExecutionInterrupt::default();
             let execution = execute_request(&item.inbound.message.content);
             let execution_count = self.count_execution(&execution);
@@ -714,14 +644,8 @@ struct ShellHandle { incoming: mpsc::Sender<Inbound>, controls: mpsc::Sender<She
 
 #[derive(Clone)]
 struct KernelServices {
-    iopub: Iopub,
-    stdin: Stdin,
-    session: Session,
-    connection: Arc<Value>,
-    supports_subshells: bool,
-    config: KernelConfig,
-    subshells: mpsc::UnboundedSender<SessionCommand>,
-    failures: mpsc::UnboundedSender<Error>,
+    iopub: Iopub, stdin: Stdin, session: Session, connection: Arc<Value>, supports_subshells: bool, config: KernelConfig,
+    subshells: mpsc::UnboundedSender<SessionCommand>, failures: mpsc::UnboundedSender<Error>
 }
 
 impl KernelServices {
@@ -729,18 +653,8 @@ impl KernelServices {
         let (incoming, requests) = mpsc::channel(256);
         let (controls, shell_controls) = mpsc::channel(64);
         let services = ShellServices { language, shared: self.clone() };
-        let shell = Shell {
-            services,
-            incoming: requests,
-            controls: shell_controls,
-            queue: BinaryHeap::new(),
-            order: 0,
-            held: None,
-            active: None,
-            stopping: false,
-            interrupting: false,
-            execution_count: 1,
-        };
+        let shell = Shell { services, incoming: requests, controls: shell_controls, queue: BinaryHeap::new(), order: 0, held: None, active: None,
+            stopping: false, interrupting: false, execution_count: 0 };
         ShellHandle { incoming, controls, task: tokio::spawn(shell.run()) }
     }
 }
@@ -760,16 +674,14 @@ async fn reply_subshell_not_found(iopub: &Iopub, session: &Session, inbound: Inb
 }
 
 async fn route_shell<L: Language>(
-    inbound: Inbound,
-    language: &L,
-    services: &KernelServices,
-    shells: &mut HashMap<String, ShellHandle>,
-    route_overrides: &HashMap<String, String>,
+    inbound: Inbound, language: &L, services: &KernelServices, shells: &mut HashMap<String, ShellHandle>, route_overrides: &HashMap<String, String>
 ) -> crate::Result<()> {
     let (iopub, session) = (&services.iopub, &services.session);
     let explicit = subshell_id(&inbound.message);
     let client_session = inbound.message.header.get("session").and_then(Value::as_str).unwrap_or("");
-    let id = if !explicit.is_empty() { explicit.to_owned() } else if inbound.message.msg_type() == "execute_request" { route_overrides.get(client_session).cloned().unwrap_or_default() } else { String::new() };
+    let id = if !explicit.is_empty() { explicit.to_owned() }
+    else if inbound.message.msg_type() == "execute_request" { route_overrides.get(client_session).cloned().unwrap_or_default() }
+    else { String::new() };
     if !explicit.is_empty() && !shells.contains_key(&id) {
         if let Err(error) = create_subshell(language, services, shells, Some(id.clone())).await {
             return reply_subshell_error(iopub, session, inbound, "SubshellCreationError", error.to_string()).await;
@@ -777,18 +689,13 @@ async fn route_shell<L: Language>(
     }
     if let Some(target) = shells.get(&id) {
         if let Err(error) = target.incoming.send(inbound).await { reply_subshell_not_found(iopub, session, error.0).await? }
-    }
-    else { reply_subshell_not_found(iopub, session, inbound).await?; }
+    } else { reply_subshell_not_found(iopub, session, inbound).await?; }
     Ok(())
 }
 
 async fn route_pending_shells<L: Language>(
-    shell: &mut mpsc::Receiver<Inbound>,
-    language: &L,
-    services: &KernelServices,
-    shells: &mut HashMap<String, ShellHandle>,
-    route_overrides: &HashMap<String, String>,
-) -> crate::Result<()> {
+    shell: &mut mpsc::Receiver<Inbound>, language: &L, services: &KernelServices, shells: &mut HashMap<String, ShellHandle>,
+    route_overrides: &HashMap<String, String>) -> crate::Result<()> {
     while let Ok(inbound) = shell.try_recv() { route_shell(inbound, language, services, shells, route_overrides).await? }
     Ok(())
 }
@@ -805,11 +712,7 @@ async fn interrupt_shells(shells: &HashMap<String, ShellHandle>) -> crate::Resul
 }
 
 async fn create_subshell(
-    language: &impl Language,
-    services: &KernelServices,
-    shells: &mut HashMap<String, ShellHandle>,
-    requested_id: Option<String>,
-) -> crate::Result<String> {
+    language: &impl Language, services: &KernelServices, shells: &mut HashMap<String, ShellHandle>, requested_id: Option<String>) -> crate::Result<String> {
     let id = requested_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     if id.is_empty() { return Err(Error::new(ErrorKind::InvalidInput, "subshell_id cannot be empty")); }
     if !language.supports_children() { return Err(Error::new(ErrorKind::Unavailable, "subshells are not supported")); }
@@ -861,16 +764,8 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
     let supports_children = language.supports_children();
     let (subshell_send, mut subshell_commands) = mpsc::unbounded_channel();
     let (failures, mut failed) = mpsc::unbounded_channel();
-    let kernel_services = KernelServices {
-        iopub: iopub.clone(),
-        stdin: stdin.clone(),
-        session: session.clone(),
-        connection: connection_content.clone(),
-        supports_subshells: supports_children,
-        config,
-        subshells: subshell_send.clone(),
-        failures,
-    };
+    let kernel_services = KernelServices { iopub: iopub.clone(), stdin: stdin.clone(), session: session.clone(), connection: connection_content.clone(),
+        supports_subshells: supports_children, config, subshells: subshell_send.clone(), failures };
     let mut shells = HashMap::new();
     let mut route_overrides = HashMap::<String, String>::new();
     let mut terminate = Box::pin(termination_signal());
@@ -884,7 +779,9 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
         let iopub = debug_iopub.clone();
         let session = debug_session.clone();
         let failures = debug_failures.clone();
-        runtime.spawn(async move { if let Err(error) = iopub.publish(session.message("debug_event", event, None)).await { let _ = failures.send(error); } });
+        runtime.spawn(async move {
+            if let Err(error) = iopub.publish(session.message("debug_event", event, None)).await { let _ = failures.send(error); }
+        });
     }))?;
     shells.insert(String::new(), kernel_services.spawn_shell(parent));
     let result = async {
@@ -964,16 +861,9 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
                 }
                 "create_subshell_request" => {
                     if !supports_children {
-                        send_reply(
-                            &reply,
-                            &session,
-                            &request,
-                            "create_subshell_reply",
-                            json!({
-                                "status": "error", "ename": "SubshellsNotSupported", "evalue": "kernel subshells are not supported", "traceback": [],
-                            }),
-                        )
-                        .await?;
+                        send_reply(&reply, &session, &request, "create_subshell_reply", json!({
+                            "status": "error", "ename": "SubshellsNotSupported", "evalue": "kernel subshells are not supported", "traceback": [],
+                        })).await?;
                         continue;
                     }
                     let requested_id = request.content.get("subshell_id").and_then(Value::as_str).map(str::to_owned);
@@ -993,7 +883,9 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
                         route_overrides.retain(|_, routed| routed != id);
                         stop_shell(shell, true).await?;
                         json!({"status": "ok"})
-                    } else { json!({"status": "error", "ename": "SubshellNotFound", "evalue": format!("Unknown subshell_id {id:?}"), "traceback": []}) };
+                    } else {
+                        json!({"status": "error", "ename": "SubshellNotFound", "evalue": format!("Unknown subshell_id {id:?}"), "traceback": []})
+                    };
                     send_reply(&reply, &session, &request, "delete_subshell_reply", content).await?;
                 }
                 "release_request" => {
@@ -1031,8 +923,7 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
                 _ => {}
             }
         }
-    }
-    .await;
+    }.await;
     let mut result = result;
     for (_, shell) in shells.drain() {
         if let Err(error) = stop_shell(shell, true).await { if result.is_ok() { result = Err(error); } else { eprintln!("kernel shutdown failed: {error}"); } }
@@ -1057,8 +948,7 @@ mod tests {
         let interrupt = ExecutionInterrupt::default();
         let read = stdin.request(&missing, &parent, "".into(), false, &interrupt);
         tokio::pin!(read);
-        poll_fn(|cx| { assert!(read.as_mut().poll(cx).is_pending()); Poll::Ready(()) })
-        .await;
+        poll_fn(|cx| { assert!(read.as_mut().poll(cx).is_pending()); Poll::Ready(()) }).await;
         interrupt.request()?;
         assert_eq!(read.await.unwrap_err().kind(), ErrorKind::Interrupted);
         assert!(stdin.pending.lock().await.is_empty());
@@ -1071,9 +961,7 @@ mod tests {
             let prompt = session.decode(tokio::time::timeout(Duration::from_secs(2), peer.recv()).await.unwrap()?)?;
             assert_eq!(prompt.msg_type(), "input_request");
             match scenario {
-                "interrupt" => {
-                    token.request()?;
-                }
+                "interrupt" => { token.request()?; }
                 "disconnect" => drop(peer),
                 _ => {
                     let reply = session.message("input_reply", json!({"value": ""}), Some(&prompt));
@@ -1083,8 +971,7 @@ mod tests {
             let result = tokio::time::timeout(Duration::from_secs(2), read).await.unwrap()?;
             match scenario {
                 "interrupt" => assert_eq!(result.unwrap_err().kind(), ErrorKind::Interrupted),
-                "disconnect" => assert_eq!(result.unwrap_err().kind(), ErrorKind::Closed),
-                _ => assert_eq!(result?, ""),
+                "disconnect" => assert_eq!(result.unwrap_err().kind(), ErrorKind::Closed), _ => assert_eq!(result?, "")
             }
             assert!(stdin.pending.lock().await.is_empty());
         }

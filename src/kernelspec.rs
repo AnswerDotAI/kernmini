@@ -1,10 +1,7 @@
 //! Kernelspec installation without jupyter_client: write or copy a kernelspec directory into a Jupyter kernels location.
 use crate::{Error, ErrorKind};
 use serde_json::{Map, Value};
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-};
+use std::{env, fs, path::{Path, PathBuf}};
 
 fn var(name: &str) -> Option<PathBuf> { env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from) }
 
@@ -12,13 +9,14 @@ fn var(name: &str) -> Option<PathBuf> { env::var_os(name).filter(|v| !v.is_empty
 pub fn jupyter_data_dir() -> crate::Result<PathBuf> {
     if let Some(dir) = var("JUPYTER_DATA_DIR") { return Ok(dir); }
     let home = var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok_or_else(|| Error::new(ErrorKind::Unavailable, "no home directory"))?;
-    Ok(if cfg!(target_os = "macos") { home.join("Library").join("Jupyter") } else if cfg!(windows) { var("APPDATA").unwrap_or(home).join("jupyter") } else { var("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local").join("share")).join("jupyter") })
+    Ok(if cfg!(target_os = "macos") { home.join("Library").join("Jupyter") }
+    else if cfg!(windows) { var("APPDATA").unwrap_or(home).join("jupyter") }
+    else { var("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local").join("share")).join("jupyter") })
 }
 
 /// The kernels directory: `share/jupyter/kernels` under `prefix`, or in the user data directory.
 pub fn kernels_dir(prefix: Option<&Path>) -> crate::Result<PathBuf> {
-    Ok(match prefix { Some(prefix) => prefix.join("share").join("jupyter"), None => jupyter_data_dir()? }
-    .join("kernels"))
+    Ok(match prefix { Some(prefix) => prefix.join("share").join("jupyter"), None => jupyter_data_dir()? }.join("kernels"))
 }
 
 /// Replace kernelspec `name` with an empty directory, returning it.
@@ -32,13 +30,7 @@ fn fresh(name: &str, prefix: Option<&Path>) -> crate::Result<PathBuf> {
 /// Write a `kernel.json` for `argv`, which must include `{connection_file}`, replacing kernelspec `name`.
 /// `extra` adds or replaces fields, such as `interrupt_mode`. Returns the kernelspec directory.
 pub fn install_kernelspec(
-    name: &str,
-    argv: &[String],
-    display_name: &str,
-    language: &str,
-    extra: Map<String, Value>,
-    prefix: Option<&Path>,
-) -> crate::Result<PathBuf> {
+    name: &str, argv: &[String], display_name: &str, language: &str, extra: Map<String, Value>, prefix: Option<&Path>) -> crate::Result<PathBuf> {
     let dest = fresh(name, prefix)?;
     let mut spec = Map::from_iter([("argv".into(), argv.into()), ("display_name".into(), display_name.into()), ("language".into(), language.into())]);
     spec.extend(extra);

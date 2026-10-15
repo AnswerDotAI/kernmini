@@ -10,12 +10,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<crate::Result<Value>>>>>;
 
-struct DapInner {
-    outgoing: mpsc::Sender<Vec<u8>>,
-    pending: Pending,
-    close: watch::Sender<Option<Error>>,
-    next_seq: AtomicU64,
-}
+struct DapInner { outgoing: mpsc::Sender<Vec<u8>>, pending: Pending, close: watch::Sender<Option<Error>>, next_seq: AtomicU64 }
 
 impl Drop for DapInner { fn drop(&mut self) { fail_pending(&self.pending, &self.close, Error::closed("DAP client")); } }
 
@@ -94,9 +89,8 @@ impl DapRequest {
 
     pub async fn wait(mut self, timeout: Duration) -> crate::Result<Value> {
         match tokio::time::timeout(timeout, &mut self.result).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => Err(Error::closed("DAP connection").caused_by(error)),
-            Err(error) => Err(Error::new(ErrorKind::TimedOut, format!("waiting for DAP request {}", self.seq)).caused_by(error)),
+            Ok(Ok(result)) => result, Ok(Err(error)) => Err(Error::closed("DAP connection").caused_by(error)),
+            Err(error) => Err(Error::new(ErrorKind::TimedOut, format!("waiting for DAP request {}", self.seq)).caused_by(error))
         }
     }
 }
@@ -116,10 +110,7 @@ fn fail_pending(pending: &Pending, close: &watch::Sender<Option<Error>>, error: 
 }
 
 async fn write_messages(
-    mut writer: impl AsyncWrite + Unpin,
-    mut outgoing: mpsc::Receiver<Vec<u8>>,
-    mut close: watch::Receiver<Option<Error>>,
-) -> crate::Result<()> {
+    mut writer: impl AsyncWrite + Unpin, mut outgoing: mpsc::Receiver<Vec<u8>>, mut close: watch::Receiver<Option<Error>>) -> crate::Result<()> {
     loop {
         if close.borrow().is_some() { return Ok(()); }
         tokio::select! {
@@ -152,11 +143,7 @@ async fn read_message(reader: &mut (impl AsyncBufRead + Unpin)) -> crate::Result
 }
 
 async fn read_messages(
-    reader: impl AsyncRead + Unpin,
-    pending: Pending,
-    events: mpsc::UnboundedSender<Value>,
-    mut close: watch::Receiver<Option<Error>>,
-) -> crate::Result<()> {
+    reader: impl AsyncRead + Unpin, pending: Pending, events: mpsc::UnboundedSender<Value>, mut close: watch::Receiver<Option<Error>>) -> crate::Result<()> {
     let mut reader = BufReader::new(reader);
     loop {
         if close.borrow().is_some() { return Ok(()); }
@@ -170,7 +157,6 @@ async fn read_messages(
         if message.get("type").and_then(Value::as_str) == Some("event") {
             let _ = events.send(message);
         } else if let Some(seq) = message.get("request_seq").and_then(Value::as_u64)
-            && let Some(complete) = pending.lock().expect("DAP pending lock poisoned").remove(&seq)
-        { let _ = complete.send(Ok(message)); }
+            && let Some(complete) = pending.lock().expect("DAP pending lock poisoned").remove(&seq) { let _ = complete.send(Ok(message)); }
     }
 }

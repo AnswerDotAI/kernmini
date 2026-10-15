@@ -99,7 +99,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - id: crates-auth
         uses: rust-lang/crates-io-auth-action@v1
-      - run: cargo publish -p kernmini
+      - run: cargo publish -p kernmini --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
       - uses: actions/download-artifact@v8

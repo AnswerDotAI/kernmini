@@ -6,21 +6,10 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{Notify, mpsc, oneshot};
 
 #[derive(Clone, Debug)]
-pub struct KernelInfo {
-    pub implementation: String,
-    pub implementation_version: String,
-    pub banner: String,
-    pub language_info: Value,
-}
+pub struct KernelInfo { pub implementation: String, pub implementation_version: String, pub banner: String, pub language_info: Value }
 
 #[derive(Clone, Debug)]
-pub struct ExecuteRequest {
-    pub code: String,
-    pub silent: bool,
-    pub store_history: bool,
-    pub user_expressions: Value,
-    pub allow_stdin: bool,
-}
+pub struct ExecuteRequest { pub code: String, pub silent: bool, pub store_history: bool, pub user_expressions: Value, pub allow_stdin: bool }
 
 #[derive(Clone, Debug)]
 pub struct CompleteRequest { pub code: String, pub cursor_pos: u64 }
@@ -38,30 +27,21 @@ pub struct LanguageError { pub ename: String, pub evalue: String, pub traceback:
 
 #[derive(Clone, Debug)]
 pub struct ExecuteOutcome {
-    pub result: Option<Value>,
-    pub result_metadata: Value,
-    pub error: Option<LanguageError>,
-    pub user_expressions: Value,
-    pub payload: Value,
+    pub result: Option<Value>, pub result_metadata: Value, pub error: Option<LanguageError>, pub user_expressions: Value, pub payload: Value
 }
 
 impl Default for ExecuteOutcome {
-    fn default() -> Self {
-        Self { result: None, result_metadata: json!({}), error: None, user_expressions: json!({}), payload: json!([]) }
-    }
+    fn default() -> Self { Self { result: None, result_metadata: json!({}), error: None, user_expressions: json!({}), payload: json!([]) } }
 }
 
 #[derive(Clone, Debug)]
 pub enum LanguageEvent {
-    Stream { name: String, text: String },
-    Display { event: Value, buffers: Vec<Vec<u8>> },
-    Message { msg_type: String, content: Value, metadata: Value, identity: Option<Vec<u8>>, buffers: Vec<Vec<u8>> },
+    Stream { name: String, text: String }, Display { event: Value, buffers: Vec<Vec<u8>> },
+    Message { msg_type: String, content: Value, metadata: Value, identity: Option<Vec<u8>>, buffers: Vec<Vec<u8>> }
 }
 
 pub(crate) enum ContextMessage {
-    Event(LanguageEvent),
-    Flush(oneshot::Sender<()>),
-    Input { prompt: String, password: bool, complete: std::sync::mpsc::SyncSender<crate::Result<String>> },
+    Event(LanguageEvent), Flush(oneshot::Sender<()>), Input { prompt: String, password: bool, complete: std::sync::mpsc::SyncSender<crate::Result<String>> }
 }
 
 pub(crate) enum SessionCommand {
@@ -83,7 +63,9 @@ impl ExecutionInterrupt {
         self.changed.notify_waiters();
         let handler = {
             let mut registration = self.handler.lock().expect("execution interrupt lock poisoned");
-            if registration.delivered { None } else if let Some(handler) = registration.handler.clone() { registration.delivered = true; Some(handler) } else { None }
+            if registration.delivered { None }
+            else if let Some(handler) = registration.handler.clone() { registration.delivered = true; Some(handler) }
+            else { None }
         };
         if let Some(handler) = handler { handler()? }
         Ok(first)
@@ -112,33 +94,18 @@ impl ExecutionInterrupt {
 
 #[derive(Clone)]
 pub struct ExecutionContext {
-    events: mpsc::Sender<ContextMessage>,
-    interrupt: ExecutionInterrupt,
-    subshells: Option<Arc<SubshellAccess>>,
-    parent: Arc<Value>,
-    allow_stdin: bool,
-    execution_count: u64,
+    events: mpsc::Sender<ContextMessage>, interrupt: ExecutionInterrupt, subshells: Option<Arc<SubshellAccess>>, parent: Arc<Value>, allow_stdin: bool,
+    execution_count: u64
 }
 
 struct SubshellAccess { client_session: String, commands: mpsc::UnboundedSender<SessionCommand> }
 
 impl ExecutionContext {
     pub(crate) fn new(
-        events: mpsc::Sender<ContextMessage>,
-        interrupt: ExecutionInterrupt,
-        subshells: Option<(String, mpsc::UnboundedSender<SessionCommand>)>,
-        parent: Value,
-        allow_stdin: bool,
-        execution_count: u64,
-    ) -> Self {
-        Self {
-            events,
-            interrupt,
-            subshells: subshells.map(|(client_session, commands)| Arc::new(SubshellAccess { client_session, commands })),
-            parent: Arc::new(parent),
-            allow_stdin,
-            execution_count,
-        }
+        events: mpsc::Sender<ContextMessage>, interrupt: ExecutionInterrupt, subshells: Option<(String, mpsc::UnboundedSender<SessionCommand>)>, parent: Value,
+        allow_stdin: bool, execution_count: u64) -> Self {
+        Self { events, interrupt, subshells: subshells.map(|(client_session, commands)| Arc::new(SubshellAccess { client_session, commands })),
+            parent: Arc::new(parent), allow_stdin, execution_count }
     }
 
     pub async fn emit(&self, event: LanguageEvent) -> crate::Result<()> { self.events.send(ContextMessage::Event(event)).await?; Ok(()) }
@@ -188,9 +155,7 @@ pub trait LanguageSession: Clone + Send + Sync + 'static {
     fn supports_debugger(&self) -> bool { false }
     fn set_debug_sender(&self, _sender: DebugEventSender) -> crate::Result<()> { Ok(()) }
     async fn execute(&self, request: ExecuteRequest, context: ExecutionContext) -> crate::Result<ExecuteOutcome>;
-    async fn complete(&self, request: CompleteRequest) -> crate::Result<Value> {
-        Ok(reply_defaults::complete(request.cursor_pos))
-    }
+    async fn complete(&self, request: CompleteRequest) -> crate::Result<Value> { Ok(reply_defaults::complete(request.cursor_pos)) }
     async fn inspect(&self, _request: InspectRequest) -> crate::Result<Value> { Ok(reply_defaults::inspect()) }
     async fn is_complete(&self, _code: String) -> crate::Result<Value> { Ok(reply_defaults::is_complete()) }
     async fn history(&self, _request: Value) -> crate::Result<Value> { Ok(reply_defaults::history()) }

@@ -13,16 +13,7 @@ impl<T: 'static> ThreadWorker<T> {
         let (jobs, receive) = mpsc::channel();
         let (ready, initialized) = oneshot::channel();
         builder.spawn(move || {
-            let mut state = match create() {
-                Ok(state) => {
-                    let _ = ready.send(Ok(()));
-                    state
-                }
-                Err(error) => {
-                    let _ = ready.send(Err(error));
-                    return;
-                }
-            };
+            let mut state = match create() { Ok(state) => { let _ = ready.send(Ok(())); state } Err(error) => { let _ = ready.send(Err(error)); return; } };
             while let Ok(job) = receive.recv() {
                 match job {
                     Job::Call(call) => call(&mut state),

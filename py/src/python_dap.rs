@@ -7,11 +7,9 @@ use std::future::Future;
 use std::sync::Mutex;
 use std::time::Duration;
 
-fn runtime_block_on<F, T>(py: Python<'_>, future: F) -> PyResult<T>
-where
-    F: Future<Output = kernmini::Result<T>> + Send,
-    T: Send,
-{ py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(future)).map_err(py_error) }
+fn runtime_block_on<F, T>(py: Python<'_>, future: F) -> PyResult<T> where F: Future<Output = kernmini::Result<T>> + Send, T: Send {
+    py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(future)).map_err(py_error)
+}
 
 fn timeout_duration(seconds: f64) -> PyResult<Duration> {
     Duration::try_from_secs_f64(seconds).map_err(|error| PyValueError::new_err(format!("invalid DAP timeout: {error}")))
@@ -80,7 +78,9 @@ impl PyDapClient {
     }
 }
 
-impl Drop for PyDapClient { fn drop(&mut self) { if let Some(client) = self.client.get_mut().expect("DAP client lock poisoned").take() { client.close(); } } }
+impl Drop for PyDapClient {
+    fn drop(&mut self) { if let Some(client) = self.client.get_mut().expect("DAP client lock poisoned").take() { client.close(); } }
+}
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyDapClient>()?;
