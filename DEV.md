@@ -124,15 +124,15 @@ An operation is an `execute_request` with empty `code`. Its `metadata` has one k
 
 Clients send operations with `store_history: false`, `silent: false` and `stop_on_error: false`. An operation then doesn't advance the execution count. A failed operation doesn't abort queued cells.
 
-A language lists the operations it implements in `KernelInfo::supported_features`. Kernmini reports them in `kernel_info_reply`'s `supported_features`, together with its own `kernel subshells` and `debugger` entries. A Python shell returns the list as `supported_features` in its `kernel_info()` dict. Clients send an operation only to a kernel that lists it.
+A language lists the operations it implements in `LanguageSession::supported_features()`, which returns none by default. Kernmini reports them in `kernel_info_reply`'s `supported_features`, together with its own `kernel subshells` and `debugger` entries. A Python shell returns the list as `supported_features` in its `kernel_info()` dict. Clients send an operation only to a kernel that lists it.
 
 Each operation publishes its result on IOPub:
 
 - `schemas` publishes one `execute_result`. Its `application/json` maps each requested name to the tool's schema, or to an error message when the name doesn't resolve to a callable. A schema has `name`, `description` and `parameters`. `name` is the requested name. `parameters` is a JSON Schema object.
 - `call` publishes the tool's prints and displays as usual, then its return value as one `execute_result`. The tool result is every output of the execute, in order. A tool gives text plus images by displaying the images and returning the text. An exception gives the usual `error` message and error reply.
-- `eval` publishes one `execute_result`. Its `application/json` maps each expression to a record in the format of a `user_expressions` reply: `{"status": "ok", "data": ..., "metadata": ...}`, or `{"status": "error", "ename": ..., "evalue": ..., "traceback": [...]}`.
+- `eval` publishes one `execute_result`. Its `application/json` maps each expression to a record in the format of a `user_expressions` reply: `{"status": "ok", "data": ..., "metadata": ...}`, or `{"status": "error", "ename": ..., "evalue": ..., "traceback": [...]}`. An `ok` record's `metadata` may give the value's type name in the kernel's language as `type`.
 
-`call` results and `eval` values are formatted for a reader, not as source. A string is its text in `text/plain`, Markdown uses `text/markdown`, and binary data such as an image is base64 text. An output or record whose `metadata` has `full: true` must not be truncated. ipymini sets it for `Safe`, `FullResponse` and `PrettyString` values.
+`call` results and `eval` values are formatted for a reader, not as source. A string is its text in `text/plain`, Markdown uses `text/markdown`, and binary data such as an image or a PDF is base64 text under its MIME type. An output or record whose `metadata` has `full: true` must not be truncated. ipymini sets it for `Safe`, `FullResponse` and `PrettyString` values.
 
 ## Output and stdin
 

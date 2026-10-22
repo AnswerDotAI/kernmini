@@ -275,9 +275,13 @@ impl LanguageSession for PyLanguageSession {
             let value = py_to_json(py, self.target.call_method0(py, "kernel_info")?.bind(py))?;
             Ok(KernelInfo { implementation: value["implementation"].as_str().unwrap_or("python").to_owned(),
                 implementation_version: value["implementation_version"].as_str().unwrap_or("0").to_owned(),
-                banner: value["banner"].as_str().unwrap_or("").to_owned(), language_info: value.get("language_info").cloned().unwrap_or_else(|| json!({})),
-                supported_features: serde_json::from_value(value["supported_features"].clone()).unwrap_or_default() })
+                banner: value["banner"].as_str().unwrap_or("").to_owned(), language_info: value.get("language_info").cloned().unwrap_or_else(|| json!({})) })
         }).map_err(Error::adapter)
+    }
+
+    fn supported_features(&self) -> Vec<String> {
+        Python::attach(|py| -> PyResult<Value> { py_to_json(py, self.target.call_method0(py, "kernel_info")?.bind(py)) })
+            .ok().and_then(|value| serde_json::from_value(value["supported_features"].clone()).ok()).unwrap_or_default()
     }
 
     fn supports_debugger(&self) -> bool { Python::attach(|py| self.target.bind(py).hasattr("debug_request")).unwrap_or(false) }

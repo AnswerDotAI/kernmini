@@ -345,7 +345,7 @@ async fn handle_shell(services: &ShellServices<impl LanguageSession>, inbound: I
                 "kernel_info_request" => {
                     let info = language.kernel_info()?;
                     let debugger = language.supports_debugger();
-                    let mut features = info.supported_features;
+                    let mut features = language.supported_features();
                     if services.shared.supports_subshells { features.push("kernel subshells".into()); }
                     if debugger { features.push("debugger".into()); }
                     json!({
