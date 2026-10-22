@@ -116,6 +116,22 @@ async def test_ipython_story():
             interrupted = _one(running_msgs, 'execute_reply')['content']
             assert (interrupted['status'], interrupted['ename']) == ('error', 'KeyboardInterrupt')
 
+        # Deleting a subshell whose code ignores the interrupt leaves the control channel responsive.
+        stubborn = kc.run("import time\nstop = False\nprint('stubborn', flush=True)\nwhile not stop:\n    try: time.sleep(.05)\n"
+            "    except KeyboardInterrupt: pass", subshell_id='stubborn', timeout=10)
+        stubborn_msgs = await _until_stream(stubborn, 'stubborn\n')
+        deleting = asyncio.ensure_future(kc.ctl.delete_subshell(subshell_id='stubborn', timeout=10))
+        while 'stubborn' in (await kc.ctl.list_subshell(timeout=5))['content']['subshell_id']: pass
+        assert (await kc.reply('stop = True', timeout=5))['content']['status'] == 'ok'
+        assert (await deleting)['content']['status'] == 'ok'
+        stubborn_msgs += [m async for m in stubborn]
+        assert _one(stubborn_msgs, 'execute_reply')['content']['status'] == 'ok'
+
+        # A comm opened outside any execution still reaches clients, with an empty parent header.
+        await _run(kc, "import contextvars\nfrom comm import create_comm\n"
+            "loop.call_soon(lambda: create_comm(target_name='orphan', data={'n': 1}), context=contextvars.Context())")
+        orphan = await qs.jmsg_for('comm_open', pred=lambda m: m['content']['target_name'] == 'orphan', queue='iopub', timeout=5)
+        assert orphan['parent_header'] == {} and orphan['content']['data'] == {'n': 1}
         missing_id = kc.new_msg_id()
         missing = await kc.shell_request('execute_request', msg_id=missing_id, timeout=5)
         states = []

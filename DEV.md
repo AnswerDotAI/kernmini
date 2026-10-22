@@ -60,7 +60,7 @@ The factory takes no arguments and may return a shell directly or an awaitable s
 
 A Python shell provides:
 
-- `kernel_info()`: implementation, version, banner, and `language_info`.
+- `kernel_info()`: implementation, version, banner, `language_info` and optional `supported_features`.
 - `execute(code, silent=, store_history=, user_expressions=, allow_stdin=, execution_count=)`: an awaitable returning optional `result`, `result_metadata`, `error`, `user_expressions`, and `payload`.
 
 The adapter uses optional capabilities when present:
@@ -110,9 +110,35 @@ Two execute metadata extensions are supported:
 
 An explicit `subshell_id` on a shell request creates that named subshell when missing, then routes the request there. `create_subshell_request` also accepts an optional `subshell_id`; a supplied ID makes explicit creation idempotent. Python code can use `kernmini.subshell()` to route later requests from its client session through a temporary child, or `kernmini.sidecar()` to route through the persistent named `sidecar` subshell.
 
+`delete_subshell_request` interrupts the subshell, then replies once its active execution has ended. Leaving `kernmini.subshell()` deletes its temporary subshell the same way, without the interrupt. The control channel keeps serving other requests while a deletion waits. Code that ignores the interrupt delays only its own deletion.
+
+## Kernel operations
+
+Kernel operations let a client get tool schemas, call a tool or evaluate expressions without sending source code in the kernel's language. Rustygate uses them to run an AI turn's tools and `$` references in any kernel. Languages implement the operations. Kernmini only reports which ones a language supports.
+
+An operation is an `execute_request` with empty `code`. Its `metadata` has one key, named after the operation. The key's value holds the parameters:
+
+- `{"schemas": ["f", "g.h"]}` asks for the schemas of the named tools. Each name is the expression that names a tool, such as `f` or `g.h`.
+- `{"call": {"name": "g.h", "args": {"x": 1}}}` calls a tool. The language converts the JSON arguments to the types the tool expects, and waits for an asynchronous result.
+- `{"eval": ["x", "len(y)"]}` evaluates expressions. Awaitable results aren't awaited.
+
+Clients send operations with `store_history: false`, `silent: false` and `stop_on_error: false`. An operation then doesn't advance the execution count. A failed operation doesn't abort queued cells.
+
+A language lists the operations it implements in `KernelInfo::supported_features`. Kernmini reports them in `kernel_info_reply`'s `supported_features`, together with its own `kernel subshells` and `debugger` entries. A Python shell returns the list as `supported_features` in its `kernel_info()` dict. Clients send an operation only to a kernel that lists it.
+
+Each operation publishes its result on IOPub:
+
+- `schemas` publishes one `execute_result`. Its `application/json` maps each requested name to the tool's schema, or to an error message when the name doesn't resolve to a callable. A schema has `name`, `description` and `parameters`. `name` is the requested name. `parameters` is a JSON Schema object.
+- `call` publishes the tool's prints and displays as usual, then its return value as one `execute_result`. The tool result is every output of the execute, in order. A tool gives text plus images by displaying the images and returning the text. An exception gives the usual `error` message and error reply.
+- `eval` publishes one `execute_result`. Its `application/json` maps each expression to a record in the format of a `user_expressions` reply: `{"status": "ok", "data": ..., "metadata": ...}`, or `{"status": "error", "ename": ..., "evalue": ..., "traceback": [...]}`.
+
+`call` results and `eval` values are formatted for a reader, not as source. A string is its text in `text/plain`, Markdown uses `text/markdown`, and binary data such as an image is base64 text. An output or record whose `metadata` has `full: true` must not be truncated. ipymini sets it for `Safe`, `FullResponse` and `PrettyString` values.
+
 ## Output and stdin
 
 `ExecutionContext` is the single output boundary. Native async producers call `emit(LanguageEvent).await`; producers on synchronous execution threads call `emit_blocking(LanguageEvent)`. Both return an error if the output channel has closed. The Python callbacks release the GIL while sending. The Rust engine associates every stream, display, buffer, stdin request, and arbitrary published message with its execution before sending it over IOPub or stdin. The PyO3 adapter keeps the current context in a ContextVar so Python callbacks and IPython comm handlers reach the correct sink.
+
+The engine gives the parent session a parentless context at startup, through `LanguageSession::set_kernel_context`. The Python adapter publishes comm messages through it when no execution is current, such as messages from a task that an extension starts with the kernel. These messages carry an empty parent header.
 
 `KERNMINI_IOPUB_QMAX` bounds each execution's event queue and each IOPub peer's outgoing queue, in messages, and defaults to 10000. Full queues wait for space instead of dropping events; a slow direct IOPub subscriber can slow execution. This is not an output-byte limit. Environment configuration is read once when the kernel starts and shared by its parent and child sessions.
 

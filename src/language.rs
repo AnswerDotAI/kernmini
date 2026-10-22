@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{Notify, mpsc, oneshot};
 
 #[derive(Clone, Debug)]
-pub struct KernelInfo { pub implementation: String, pub implementation_version: String, pub banner: String, pub language_info: Value }
+pub struct KernelInfo { pub implementation: String, pub implementation_version: String, pub banner: String, pub language_info: Value, pub supported_features: Vec<String> }
 
 #[derive(Clone, Debug)]
 pub struct ExecuteRequest { pub code: String, pub silent: bool, pub store_history: bool, pub user_expressions: Value, pub allow_stdin: bool }
@@ -154,6 +154,8 @@ pub trait LanguageSession: Clone + Send + Sync + 'static {
     fn kernel_info(&self) -> crate::Result<KernelInfo>;
     fn supports_debugger(&self) -> bool { false }
     fn set_debug_sender(&self, _sender: DebugEventSender) -> crate::Result<()> { Ok(()) }
+    /// Takes the kernel's parentless context, for messages sent outside any execution.
+    fn set_kernel_context(&self, _context: ExecutionContext) -> crate::Result<()> { Ok(()) }
     async fn execute(&self, request: ExecuteRequest, context: ExecutionContext) -> crate::Result<ExecuteOutcome>;
     async fn complete(&self, request: CompleteRequest) -> crate::Result<Value> { Ok(reply_defaults::complete(request.cursor_pos)) }
     async fn inspect(&self, _request: InspectRequest) -> crate::Result<Value> { Ok(reply_defaults::inspect()) }

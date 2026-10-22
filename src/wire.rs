@@ -27,7 +27,7 @@ impl std::error::Error for WireError {
 
 impl From<serde_json::Error> for WireError { fn from(error: serde_json::Error) -> Self { Self::Json(error) } }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Message {
     pub identities: Vec<Bytes>, pub header: Map<String, Value>, pub parent_header: Map<String, Value>, pub metadata: Map<String, Value>, pub content: Value,
     pub buffers: Vec<Bytes>

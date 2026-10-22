@@ -275,7 +275,8 @@ impl LanguageSession for PyLanguageSession {
             let value = py_to_json(py, self.target.call_method0(py, "kernel_info")?.bind(py))?;
             Ok(KernelInfo { implementation: value["implementation"].as_str().unwrap_or("python").to_owned(),
                 implementation_version: value["implementation_version"].as_str().unwrap_or("0").to_owned(),
-                banner: value["banner"].as_str().unwrap_or("").to_owned(), language_info: value.get("language_info").cloned().unwrap_or_else(|| json!({})) })
+                banner: value["banner"].as_str().unwrap_or("").to_owned(), language_info: value.get("language_info").cloned().unwrap_or_else(|| json!({})),
+                supported_features: serde_json::from_value(value["supported_features"].clone()).unwrap_or_default() })
         }).map_err(Error::adapter)
     }
 
@@ -286,6 +287,14 @@ impl LanguageSession for PyLanguageSession {
             if self.target.bind(py).hasattr("debugger")? {
                 self.target.getattr(py, "debugger")?.setattr(py, "event_callback", Py::new(py, DebugRouter { sender })?)?;
             }
+            Ok(())
+        }).map_err(Error::adapter)
+    }
+
+    fn set_kernel_context(&self, context: ExecutionContext) -> kernmini::Result<()> {
+        Python::attach(|py| -> PyResult<()> {
+            let sink = Py::new(py, ExecutionSink { context, target: None, locals: None, interrupted: None, wake_sync: false })?;
+            py.import("kernmini._bridge")?.call_method1("set_kernel_sink", (sink,))?;
             Ok(())
         }).map_err(Error::adapter)
     }

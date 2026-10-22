@@ -3,6 +3,13 @@ from contextlib import contextmanager, nullcontext
 from .concur import _subshell, sidecar, subshell
 
 _current = contextvars.ContextVar("kernmini.execution", default=None)
+_kernel = None
+
+
+def set_kernel_sink(sink):
+    "Publish messages sent outside any execution through `sink`, which has no parent"
+    global _kernel
+    _kernel = sink
 
 
 def run_loop(loop, fut=None):
@@ -31,7 +38,7 @@ def run_child_loop(factory, loop_factory, ready):
 
 class _IOPub:
     def send(self, msg_type, parent=None, content=None, metadata=None, ident=None, buffers=None, **kwargs):
-        sink = _current.get()
+        sink = _current.get() or _kernel
         if sink is not None: sink.publish(msg_type, content or kwargs, metadata or {}, ident, buffers or [])
 
 

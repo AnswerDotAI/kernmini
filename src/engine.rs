@@ -345,9 +345,9 @@ async fn handle_shell(services: &ShellServices<impl LanguageSession>, inbound: I
                 "kernel_info_request" => {
                     let info = language.kernel_info()?;
                     let debugger = language.supports_debugger();
-                    let mut features = vec![];
-                    if services.shared.supports_subshells { features.push("kernel subshells"); }
-                    if debugger { features.push("debugger"); }
+                    let mut features = info.supported_features;
+                    if services.shared.supports_subshells { features.push("kernel subshells".into()); }
+                    if debugger { features.push("debugger".into()); }
                     json!({
                         "status": "ok", "protocol_version": "5.3",
                         "implementation": info.implementation,
@@ -657,6 +657,15 @@ impl KernelServices {
             stopping: false, interrupting: false, execution_count: 0 };
         ShellHandle { incoming, controls, task: tokio::spawn(shell.run()) }
     }
+
+    /// Stops `shell` without blocking the caller, then runs `done`. Code that ignores the interrupt can keep a shell running indefinitely.
+    fn stop_in_background(&self, shell: ShellHandle, interrupt: bool, done: impl Future<Output = crate::Result<()>> + Send + 'static) {
+        let failures = self.failures.clone();
+        tokio::spawn(async move {
+            let result = async { stop_shell(shell, interrupt).await?; done.await }.await;
+            if let Err(error) = result { let _ = failures.send(error); }
+        });
+    }
 }
 
 fn subshell_id(request: &Message) -> &str { request.header.get("subshell_id").and_then(Value::as_str).filter(|id| !id.is_empty()).unwrap_or("") }
@@ -783,6 +792,7 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
             if let Err(error) = iopub.publish(session.message("debug_event", event, None)).await { let _ = failures.send(error); }
         });
     }))?;
+    parent.set_kernel_context(kernel_services.output_context(&Message::default(), None, false, ExecutionInterrupt::default(), 0))?;
     shells.insert(String::new(), kernel_services.spawn_shell(parent));
     let result = async {
         loop {
@@ -830,16 +840,15 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
                             let _ = complete.send(result);
                         }
                         SessionCommand::Close { client_session, subshell_id, delete, complete } => {
-                            let result = if route_overrides.get(&client_session) == Some(&subshell_id) {
-                                route_overrides.remove(&client_session);
-                                if delete {
-                                    if let Some(shell) = shells.remove(&subshell_id) { stop_shell(shell, false).await?; }
-                                }
-                                Ok(())
+                            if route_overrides.get(&client_session) != Some(&subshell_id) {
+                                let _ = complete.send(Err(Error::new(ErrorKind::InvalidInput, "subshell route is not active")));
                             } else {
-                                Err(Error::new(ErrorKind::InvalidInput, "subshell route is not active"))
-                            };
-                            let _ = complete.send(result);
+                                route_overrides.remove(&client_session);
+                                match delete.then(|| shells.remove(&subshell_id)).flatten() {
+                                    Some(shell) => kernel_services.stop_in_background(shell, false, async move { let _ = complete.send(Ok(())); Ok(()) }),
+                                    None => { let _ = complete.send(Ok(())); }
+                                }
+                            }
                         }
                     }
                     continue;
@@ -878,15 +887,17 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
                     send_reply(&reply, &session, &request, "list_subshell_reply", json!({"status": "ok", "subshell_id": ids})).await?;
                 }
                 "delete_subshell_request" => {
-                    let id = request.content.get("subshell_id").and_then(Value::as_str).unwrap_or("");
-                    let content = if let Some(shell) = shells.remove(id) {
-                        route_overrides.retain(|_, routed| routed != id);
-                        stop_shell(shell, true).await?;
-                        json!({"status": "ok"})
+                    let id = request.content.get("subshell_id").and_then(Value::as_str).unwrap_or("").to_owned();
+                    if let Some(shell) = shells.remove(&id) {
+                        route_overrides.retain(|_, routed| routed != &id);
+                        let session = session.clone();
+                        kernel_services.stop_in_background(shell, true, async move {
+                            send_reply(&reply, &session, &request, "delete_subshell_reply", json!({"status": "ok"})).await
+                        });
                     } else {
-                        json!({"status": "error", "ename": "SubshellNotFound", "evalue": format!("Unknown subshell_id {id:?}"), "traceback": []})
-                    };
-                    send_reply(&reply, &session, &request, "delete_subshell_reply", content).await?;
+                        send_reply(&reply, &session, &request, "delete_subshell_reply", json!({
+                            "status": "error", "ename": "SubshellNotFound", "evalue": format!("Unknown subshell_id {id:?}"), "traceback": []})).await?;
+                    }
                 }
                 "release_request" => {
                     route_pending_shells(&mut shell, &language, &kernel_services, &mut shells, &route_overrides).await?;
