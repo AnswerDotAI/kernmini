@@ -1,6 +1,6 @@
 "The real ipymini language adapter hosted directly by kernmini and driven by ConKernelClient."
 
-import asyncio, os, sys
+import asyncio, os, sys, time
 
 import pytest
 from conkernelclient import JmsgQueues, run_kernel
@@ -115,6 +115,18 @@ async def test_ipython_story():
             running_msgs += [m async for m in running]
             interrupted = _one(running_msgs, 'execute_reply')['content']
             assert (interrupted['status'], interrupted['ename']) == ('error', 'KeyboardInterrupt')
+
+        # Completions that wait for the GIL, here held by a regex in C code, leave the control channel responsive.
+        holding = kc.run("import re\nprint('holding', flush=True)\nre.match(r'(a+)+$', 'a'*26 + 'b')", timeout=30)
+        holding_msgs = await _until_stream(holding, 'holding\n')
+        completes = [asyncio.ensure_future(kc.shell_request('complete_request', code='x.rea', cursor_pos=5, timeout=30, subshell_id=sid))
+            for sid in (None, 'sidecar')]
+        start = time.monotonic()
+        await kc.ctl.list_subshell(timeout=5)
+        assert time.monotonic() - start < 0.5
+        holding_msgs += [m async for m in holding]
+        assert _one(holding_msgs, 'execute_reply')['content']['status'] == 'ok'
+        assert all(reply['content']['status'] == 'ok' for reply in await asyncio.gather(*completes))
 
         # Deleting a subshell whose code ignores the interrupt leaves the control channel responsive.
         stubborn = kc.run("import time\nstop = False\nprint('stubborn', flush=True)\nwhile not stop:\n    try: time.sleep(.05)\n"

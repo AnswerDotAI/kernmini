@@ -74,7 +74,7 @@ The adapter uses optional capabilities when present:
 - `debug_request` and a `debugger.event_callback` provide language-specific DAP integration; `kernmini._native.DapClient` is the optional shared transport.
 - `comm_info` and `message` provide the language's comm manager and incoming comm dispatch. Both may be synchronous or awaitable. Kernmini knows nothing about IPython or ipymini comm objects.
 - `comm_manager`, when exposed by the shell, is available through the kernel proxy passed to `bind_kernel`.
-- `interrupt()` is a synchronous native-language interrupt hook, called directly on the control thread instead of cancelling Python execution. It must be thread-safe and return promptly; it should signal the interpreter, not queue behind its execution.
+- `interrupt()` is a synchronous native-language interrupt hook, called on a thread of its own instead of cancelling Python execution. It must be thread-safe and return promptly; it should signal the interpreter, not queue behind its execution.
 - `shutdown()` runs on the shell's owning loop before that loop stops. It may be synchronous or awaitable.
 
 Python adapters for synchronous native interpreters can use the same `ThreadWorker` as Rust:
@@ -93,7 +93,15 @@ The parent shell runs on a persistent asyncio loop in the Python main thread. Ch
 
 A `SystemExit` raised inside a task leaves the loop rather than the task, so `kernmini._bridge.run_loop` drives every loop and re-enters it: user code cannot end the kernel.
 
-`pyo3-async-runtimes` bridges Python awaitables onto their owning loop. Without a shell `interrupt()` hook, interrupts cancel async cells through that loop and inject `KeyboardInterrupt` into synchronous Python. Arbitrary C code cannot be interrupted safely without its own interrupt API; native adapters use the hook to call that API.
+`pyo3-async-runtimes` bridges Python awaitables onto their owning loop. kernmini runs its Python calls on Tokio's blocking threads. Its worker threads, which serve heartbeats and control requests, never wait for the GIL. A cell that holds the GIL in C code then delays only the requests that need Python.
+
+A shell runs synchronous user code inside `with kernmini.user_code():`, as ipymini does around `run_cell` and its kernel operations. Without an `interrupt()` hook, kernmini delivers each interrupt request in one of three ways:
+
+- Code inside `user_code()` gets `KeyboardInterrupt`. On the main thread, kernmini sends SIGINT. Its SIGINT handler raises the exception. SIGINT also ends a blocking system call such as `time.sleep`. On a subshell's thread, kernmini injects the exception with `PyThreadState_SetAsyncExc`.
+- An interrupt that arrives before the block starts raises `KeyboardInterrupt` as the block is entered.
+- Outside `user_code()`, kernmini cancels the execution's task when its event loop next runs. The task gets `CancelledError` at its next `await`.
+
+Every request is delivered. A second interrupt reaches code that caught the first. Any SIGINT that kernmini didn't send, such as Ctrl-C in a terminal, interrupts the whole kernel, as `interrupt_request` does. An interrupted execution that ends in `CancelledError`, or in a `KeyboardInterrupt` the shell didn't catch, gets a `KeyboardInterrupt` reply. Arbitrary C code cannot be interrupted safely without its own interrupt API; native adapters use the hook to call that API.
 
 ## Execution and concurrency
 
@@ -132,7 +140,7 @@ Each operation publishes its result on IOPub:
 - `call` publishes the tool's prints and displays as usual, then its return value as one `execute_result`. The tool result is every output of the execute, in order. A tool gives text plus images by displaying the images and returning the text. An exception gives the usual `error` message and error reply.
 - `eval` publishes one `execute_result`. Its `application/json` maps each expression to a record in the format of a `user_expressions` reply: `{"status": "ok", "data": ..., "metadata": ...}`, or `{"status": "error", "ename": ..., "evalue": ..., "traceback": [...]}`. An `ok` record's `metadata` may give the value's type name in the kernel's language as `type`.
 
-`call` results and `eval` values are formatted for a reader, not as source. A string is its text in `text/plain`, Markdown uses `text/markdown`, and binary data such as an image or a PDF is base64 text under its MIME type. An output or record whose `metadata` has `full: true` must not be truncated. ipymini sets it for `Safe`, `FullResponse` and `PrettyString` values.
+`call` results and `eval` values are formatted for a reader, not as source. A string is its text in `text/plain`, Markdown uses `text/markdown`, and binary data such as an image or a PDF is base64 text under its MIME type. An output or record whose `metadata` has `full: true` must not be truncated. ipymini sets it for any value whose class sets `full = True`, as fastcore's `Safe` and `PrettyString` and aidialog's `FullResponse` do.
 
 ## Output and stdin
 

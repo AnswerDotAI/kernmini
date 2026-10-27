@@ -14,13 +14,13 @@ fn execution_interrupt_story() {
     interrupt.set_handler(Arc::new(move || { called.fetch_add(1, Ordering::AcqRel); Ok(()) })).unwrap();
     assert_eq!(calls.load(Ordering::Acquire), 1);
     assert!(!interrupt.request().unwrap());
-    assert_eq!(calls.load(Ordering::Acquire), 1);
+    assert_eq!(calls.load(Ordering::Acquire), 2);
 
     let ready = ExecutionInterrupt::default();
     let called = calls.clone();
     ready.set_handler(Arc::new(move || { called.fetch_add(1, Ordering::AcqRel); Ok(()) })).unwrap();
     assert!(ready.request().unwrap());
-    assert_eq!(calls.load(Ordering::Acquire), 2);
+    assert_eq!(calls.load(Ordering::Acquire), 3);
     assert_eq!(ready.set_handler(Arc::new(|| Ok(()))).unwrap_err().kind(), ErrorKind::InvalidInput);
 }
 

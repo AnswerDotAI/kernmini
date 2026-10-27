@@ -73,6 +73,12 @@ def request_input(prompt, password):
     raise error
 
 
+def user_code():
+    "Context manager for a shell's synchronous user code. kernmini interrupts code inside it by raising `KeyboardInterrupt`."
+    sink = _current.get()
+    return nullcontext() if sink is None else sink
+
+
 def bind_shell(target):
     for method,callback in [('set_stream_sender', stream), ('set_display_sender', display), ('set_input_sender', request_input)]:
         if hasattr(target, method): getattr(target, method)(callback)

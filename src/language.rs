@@ -51,22 +51,17 @@ pub(crate) enum SessionCommand {
 
 pub type InterruptHandler = Arc<dyn Fn() -> crate::Result<()> + Send + Sync>;
 
+/// The interrupt requests for one execution. Every request calls the registered handler, not just the first.
 #[derive(Clone, Default)]
-pub struct ExecutionInterrupt { requested: Arc<AtomicBool>, handler: Arc<Mutex<InterruptRegistration>>, changed: Arc<Notify> }
-
-#[derive(Default)]
-struct InterruptRegistration { handler: Option<InterruptHandler>, delivered: bool }
+pub struct ExecutionInterrupt { requested: Arc<AtomicBool>, handler: Arc<Mutex<Option<InterruptHandler>>>, changed: Arc<Notify> }
 
 impl ExecutionInterrupt {
     pub fn request(&self) -> crate::Result<bool> {
-        let first = !self.requested.swap(true, Ordering::AcqRel);
-        self.changed.notify_waiters();
-        let handler = {
-            let mut registration = self.handler.lock().expect("execution interrupt lock poisoned");
-            if registration.delivered { None }
-            else if let Some(handler) = registration.handler.clone() { registration.delivered = true; Some(handler) }
-            else { None }
+        let (first, handler) = {
+            let handler = self.handler.lock().expect("execution interrupt lock poisoned");
+            (!self.requested.swap(true, Ordering::AcqRel), handler.clone())
         };
+        self.changed.notify_waiters();
         if let Some(handler) = handler { handler()? }
         Ok(first)
     }
@@ -81,13 +76,13 @@ impl ExecutionInterrupt {
     }
 
     pub fn set_handler(&self, handler: InterruptHandler) -> crate::Result<()> {
-        let deliver = {
-            let mut registration = self.handler.lock().expect("execution interrupt lock poisoned");
-            if registration.handler.is_some() { return Err(Error::new(ErrorKind::InvalidInput, "execution interrupt handler already registered")); }
-            registration.handler = Some(handler.clone());
-            if self.requested() && !registration.delivered { registration.delivered = true; true } else { false }
+        let requested = {
+            let mut registered = self.handler.lock().expect("execution interrupt lock poisoned");
+            if registered.is_some() { return Err(Error::new(ErrorKind::InvalidInput, "execution interrupt handler already registered")); }
+            *registered = Some(handler.clone());
+            self.requested()
         };
-        if deliver { handler()? }
+        if requested { handler()? }
         Ok(())
     }
 }

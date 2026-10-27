@@ -8,6 +8,9 @@ use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 use tokio::task::{JoinError, JoinSet};
 use zmtpmini::{Incoming, Peer};
 
+/// The largest frame a client may send, such as a cell's code: 1 GiB. A larger frame breaks the connection it arrives on.
+const MAX_FRAME: usize = 1 << 30;
+
 struct SendRequest { frames: Vec<Bytes>, complete: oneshot::Sender<crate::Result<()>> }
 
 #[derive(Clone)]
@@ -81,7 +84,7 @@ fn peer_finished(result: Result<crate::Result<()>, JoinError>, channel: &str) ->
 }
 
 async fn router_peer(stream: TcpStream, session: Session, incoming: mpsc::Sender<Inbound>, peers: Option<RouterPeers>) -> crate::Result<()> {
-    let peer = Peer::router(stream).await?;
+    let peer = Peer::router(stream).await?.with_max_frame(MAX_FRAME);
     let identity = Bytes::copy_from_slice(peer.identity().unwrap_or_default());
     let (mut reader, mut writer) = peer.split();
     let (send, mut outgoing) = mpsc::channel::<SendRequest>(128);
@@ -145,7 +148,7 @@ impl Iopub {
     }
 
     async fn peer(&self, stream: TcpStream) -> crate::Result<()> {
-        let peer = Peer::xpublisher(stream).await?;
+        let peer = Peer::xpublisher(stream).await?.with_max_frame(MAX_FRAME);
         let (mut reader, mut writer) = peer.split();
         let (send, mut outgoing) = mpsc::channel::<Vec<Bytes>>(self.capacity);
         self.peers.lock().await.push(send);
@@ -178,7 +181,7 @@ pub async fn serve_heartbeat(listener: TcpListener) -> crate::Result<()> {
             stream = listener.accept() => {
                 let (stream, _) = stream?;
                 connections.spawn(async move {
-                    let (mut reader, mut writer) = Peer::reply(stream).await?.split();
+                    let (mut reader, mut writer) = Peer::reply(stream).await?.with_max_frame(MAX_FRAME).split();
                     loop {
                         match reader.recv().await? {
                             Incoming::Message(message) => writer.send(message).await?,

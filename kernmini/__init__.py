@@ -2,7 +2,7 @@
 
 import asyncio, os
 
-from ._bridge import create_shell, run_loop, session_loop
+from ._bridge import create_shell, run_loop, session_loop, user_code
 from .concur import sidecar, subshell
 
 
