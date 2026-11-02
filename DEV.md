@@ -140,7 +140,7 @@ Each operation publishes its result on IOPub:
 - `call` publishes the tool's prints and displays as usual, then its return value as one `execute_result`. The tool result is every output of the execute, in order. A tool gives text plus images by displaying the images and returning the text. An exception gives the usual `error` message and error reply.
 - `eval` publishes one `execute_result`. Its `application/json` maps each expression to a record in the format of a `user_expressions` reply: `{"status": "ok", "data": ..., "metadata": ...}`, or `{"status": "error", "ename": ..., "evalue": ..., "traceback": [...]}`. An `ok` record's `metadata` may give the value's type name in the kernel's language as `type`.
 
-`call` results and `eval` values are formatted for a reader, not as source. A string is its text in `text/plain`, Markdown uses `text/markdown`, and binary data such as an image or a PDF is base64 text under its MIME type. An output or record whose `metadata` has `full: true` must not be truncated. ipymini sets it for any value whose class sets `full = True`, as fastcore's `Safe` and `PrettyString` and aidialog's `FullResponse` do.
+`call` results and `eval` values are formatted for a reader, not as source. A string is its text in `text/plain`, Markdown uses `text/markdown`, and binary data such as an image or a PDF is base64 text under its MIME type. An output or record whose `metadata` has `full: true` must not be truncated. ipymini sets it for any value whose class sets `full = True`, as fastcore's `Safe` and `FullString` and aidialog's `FullResponse` do.
 
 ## Output and stdin
 
