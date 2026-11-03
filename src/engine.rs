@@ -16,9 +16,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
+use std::{env, future};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio::time;
 use tokio::time::Instant;
 
 #[cfg(unix)]
@@ -28,7 +30,7 @@ async fn termination_signal() {
 }
 
 #[cfg(not(unix))]
-async fn termination_signal() { std::future::pending().await }
+async fn termination_signal() { future::pending().await }
 
 #[derive(Clone, Default)]
 pub struct KernelInterrupter { notify: Arc<Notify> }
@@ -43,9 +45,9 @@ struct KernelConfig { iopub_capacity: usize, hold_timeout: Duration }
 
 impl KernelConfig {
     fn from_env() -> Self {
-        let iopub_capacity = std::env::var("KERNMINI_IOPUB_QMAX").ok().and_then(|value| value.parse().ok()).unwrap_or(10_000).max(1);
-        let hold_seconds = std::env::var("KERNMINI_HOLD_TIMEOUT").ok().and_then(|value| value.parse::<f64>().ok())
-            .filter(|value| value.is_finite() && *value >= 0.0).unwrap_or(3600.0);
+        let iopub_capacity = env::var("KERNMINI_IOPUB_QMAX").ok().and_then(|value| value.parse().ok()).unwrap_or(10_000).max(1);
+        let hold_seconds = env::var("KERNMINI_HOLD_TIMEOUT").ok().and_then(|value| value.parse::<f64>().ok()).filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(3600.0);
         Self { iopub_capacity, hold_timeout: Duration::from_secs_f64(hold_seconds) }
     }
 }
@@ -319,7 +321,7 @@ struct ActiveExecution { task: JoinHandle<Result<ExecutionDone>>, interrupt: Exe
 impl Drop for ActiveExecution { fn drop(&mut self) { self.task.abort(); } }
 
 async fn wait_execution(active: &mut Option<ActiveExecution>) -> Result<ExecutionDone> {
-    if let Some(active) = active { (&mut active.task).await? } else { std::future::pending().await }
+    if let Some(active) = active { (&mut active.task).await? } else { future::pending().await }
 }
 
 enum ShellControl { Release { msg_id: String, status: String, complete: oneshot::Sender<bool> }, Interrupt, Stop }
@@ -487,9 +489,7 @@ async fn finish_hold(execution_count: u64, iopub: &Iopub, session: &Session, ite
 
 struct Held { item: QueueItem, deadline: Instant }
 
-async fn wait_hold(deadline: Option<Instant>) {
-    if let Some(deadline) = deadline { tokio::time::sleep_until(deadline).await } else { std::future::pending().await }
-}
+async fn wait_hold(deadline: Option<Instant>) { if let Some(deadline) = deadline { time::sleep_until(deadline).await } else { future::pending().await } }
 
 fn pop_runnable(queue: &mut BinaryHeap<QueueItem>, execution_active: bool, held: Option<&Held>) -> Option<QueueItem> {
     let mut parked = vec![];
@@ -948,6 +948,7 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
 mod tests {
     use super::*;
     use crate::Result;
+    use tokio::time;
 
     #[tokio::test]
     async fn pending_input_lifetime() -> Result<()> {
@@ -971,7 +972,7 @@ mod tests {
             let token = ExecutionInterrupt::default();
             let (input, parent, interrupt) = (stdin.clone(), parent.clone(), token.clone());
             let read = tokio::spawn(async move { input.request(&Bytes::from(scenario), &parent, "prompt".into(), false, &interrupt).await });
-            let prompt = session.decode(tokio::time::timeout(Duration::from_secs(2), peer.recv()).await.unwrap()?)?;
+            let prompt = session.decode(time::timeout(Duration::from_secs(2), peer.recv()).await.unwrap()?)?;
             assert_eq!(prompt.msg_type(), "input_request");
             match scenario {
                 "interrupt" => { token.request()?; }
@@ -981,7 +982,7 @@ mod tests {
                     peer.send(session.encode(&reply)?).await?;
                 }
             }
-            let result = tokio::time::timeout(Duration::from_secs(2), read).await.unwrap()?;
+            let result = time::timeout(Duration::from_secs(2), read).await.unwrap()?;
             match scenario {
                 "interrupt" => assert_eq!(result.unwrap_err().kind(), ErrorKind::Interrupted),
                 "disconnect" => assert_eq!(result.unwrap_err().kind(), ErrorKind::Closed), _ => assert_eq!(result?, "")

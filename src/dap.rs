@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time;
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
 
@@ -89,7 +90,7 @@ impl DapRequest {
     pub fn sequence(&self) -> u64 { self.seq }
 
     pub async fn wait(mut self, timeout: Duration) -> Result<Value> {
-        match tokio::time::timeout(timeout, &mut self.result).await {
+        match time::timeout(timeout, &mut self.result).await {
             Ok(Ok(result)) => result, Ok(Err(error)) => Err(Error::closed("DAP connection").caused_by(error)),
             Err(error) => Err(Error::new(ErrorKind::TimedOut, format!("waiting for DAP request {}", self.seq)).caused_by(error))
         }

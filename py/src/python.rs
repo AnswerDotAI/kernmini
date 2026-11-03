@@ -5,14 +5,19 @@ use kernmini::{
 };
 use pyo3::exceptions::asyncio::CancelledError;
 use pyo3::exceptions::{PyKeyboardInterrupt, PyOSError, PyRuntimeError, PyTimeoutError, PyValueError};
+use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyString, PyTuple};
 use pyo3_async_runtimes::TaskLocals;
 use serde_json::{Value, json};
+use std::mem;
 use std::path::PathBuf;
+use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::thread;
 use std::thread::JoinHandle;
+use tokio::{task, time};
 
 pyo3::create_exception!(_native, KernelError, PyRuntimeError);
 
@@ -60,11 +65,11 @@ fn py_buffers(value: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<u8>>> {
 /// Runs `f` with the GIL on one of Tokio's blocking threads. A cell that holds the GIL then blocks only that thread, never the worker
 /// threads that serve heartbeats and control requests.
 async fn attach<T: Send + 'static>(f: impl FnOnce(Python<'_>) -> PyResult<T> + Send + 'static) -> Result<T> {
-    tokio::task::spawn_blocking(move || Python::attach(f)).await?.map_err(Error::adapter)
+    task::spawn_blocking(move || Python::attach(f)).await?.map_err(Error::adapter)
 }
 
 /// Runs `f` with the GIL from a synchronous method. Tokio first moves this worker thread's other tasks to another thread.
-fn attach_blocking<T>(f: impl FnOnce(Python<'_>) -> PyResult<T>) -> Result<T> { tokio::task::block_in_place(|| Python::attach(f)).map_err(Error::adapter) }
+fn attach_blocking<T>(f: impl FnOnce(Python<'_>) -> PyResult<T>) -> Result<T> { task::block_in_place(|| Python::attach(f)).map_err(Error::adapter) }
 
 fn thread_ident(py: Python<'_>) -> PyResult<libc::c_ulong> { py.import("threading")?.call_method0("get_ident")?.extract() }
 
@@ -114,7 +119,7 @@ impl Delivery {
             }
         }
         let delivery = self.clone();
-        std::thread::spawn(move || {
+        thread::spawn(move || {
             Python::attach(|py| {
                 if let Err(error) = delivery.deliver(py) { eprintln!("kernmini: interrupt delivery failed: {error}") }
             })
@@ -132,9 +137,9 @@ impl Delivery {
         };
         if let Some(thread) = thread {
             // CPython takes an unsigned long; PyO3 declares the argument as signed.
-            let changed = unsafe { pyo3::ffi::PyThreadState_SetAsyncExc(thread as libc::c_long, pyo3::ffi::PyExc_KeyboardInterrupt) };
+            let changed = unsafe { ffi::PyThreadState_SetAsyncExc(thread as libc::c_long, ffi::PyExc_KeyboardInterrupt) };
             if changed > 1 {
-                unsafe { pyo3::ffi::PyThreadState_SetAsyncExc(thread as libc::c_long, std::ptr::null_mut()); }
+                unsafe { ffi::PyThreadState_SetAsyncExc(thread as libc::c_long, ptr::null_mut()); }
                 return Err(PyRuntimeError::new_err("interrupt matched multiple Python threads"));
             }
         }
@@ -153,7 +158,7 @@ struct DeferredCancel { task: Py<PyAny>, code: SharedUserCode }
 impl DeferredCancel {
     fn __call__(&self, py: Python<'_>) -> PyResult<()> {
         if self.task.bind(py).call_method0("done")?.is_truthy()? { return Ok(()); }
-        let cancel = { let mut code = lock(&self.code); code.thread.is_none() && std::mem::take(&mut code.pending) };
+        let cancel = { let mut code = lock(&self.code); code.thread.is_none() && mem::take(&mut code.pending) };
         if cancel { self.task.call_method0(py, "cancel")?; }
         Ok(())
     }
@@ -181,7 +186,7 @@ impl ExecutionSink {
         let Some(interrupts) = &self.interrupts else { return Ok(()) };
         let thread = thread_ident(py)?;
         let mut code = lock(&interrupts.code);
-        if std::mem::take(&mut code.pending) { return Err(PyKeyboardInterrupt::new_err("")); }
+        if mem::take(&mut code.pending) { return Err(PyKeyboardInterrupt::new_err("")); }
         if code.depth == 0 { code.thread = Some(thread) }
         code.depth += 1;
         Ok(())
@@ -197,7 +202,7 @@ impl ExecutionSink {
             code.thread.take()
         };
         // A `KeyboardInterrupt` injected as the block ended may not have fired yet. It would fire outside user code.
-        if let Some(thread) = thread { unsafe { pyo3::ffi::PyThreadState_SetAsyncExc(thread as libc::c_long, std::ptr::null_mut()); } }
+        if let Some(thread) = thread { unsafe { ffi::PyThreadState_SetAsyncExc(thread as libc::c_long, ptr::null_mut()); } }
     }
 
     #[pyo3(signature = (subshell_id=None))]
@@ -254,7 +259,7 @@ impl SignalRouter {
     fn __call__(&self, _signum: i32, _frame: Py<PyAny>) -> PyResult<()> {
         let raise = {
             let mut code = lock(&self.code);
-            std::mem::take(&mut code.woken).then(|| code.thread.is_some() && std::mem::take(&mut code.pending))
+            mem::take(&mut code.woken).then(|| code.thread.is_some() && mem::take(&mut code.pending))
         };
         match raise { None => self.interrupt.interrupt(), Some(true) => return Err(PyKeyboardInterrupt::new_err("")), Some(false) => {} }
         Ok(())
@@ -285,7 +290,7 @@ impl ChildLoop {
         self.stop();
         let thread = self.thread.lock().expect("child thread lock poisoned").take();
         if let Some(thread) = thread {
-            let joined = tokio::task::spawn_blocking(move || thread.join().is_ok()).await?;
+            let joined = task::spawn_blocking(move || thread.join().is_ok()).await?;
             if !joined { return Err(Error::closed("child Python session during shutdown")); }
         }
         Ok(())
@@ -295,8 +300,8 @@ impl ChildLoop {
 impl Drop for ChildLoop {
     fn drop(&mut self) {
         self.stop();
-        if let Some(thread) = self.thread.lock().expect("child thread lock poisoned").take() && thread.thread().id() != std::thread::current().id() {
-            std::thread::spawn(move || { let _ = thread.join(); });
+        if let Some(thread) = self.thread.lock().expect("child thread lock poisoned").take() && thread.thread().id() != thread::current().id() {
+            thread::spawn(move || { let _ = thread.join(); });
         }
     }
 }
@@ -359,7 +364,7 @@ impl Language for PyLanguage {
         let thread_loop = Arc::downgrade(&child_loop);
         let (created, result) = tokio::sync::oneshot::channel();
         let created = Arc::new(Mutex::new(Some(created)));
-        let thread = std::thread::spawn(move || {
+        let thread = thread::spawn(move || {
             let outcome = Python::attach(|py| -> PyResult<()> {
                 let ready = Py::new(py, ChildReady { created: created.clone(), child_loop: thread_loop })?;
                 py.import("kernmini._bridge")?.call_method1("run_child_loop", (factory.bind(py), loop_factory.bind(py), ready))?;
@@ -539,7 +544,7 @@ fn run_kernel<'py>(
         if owns_process_group {
             if let Err(error) = &result { eprintln!("kernel failed: {error}"); }
             unsafe { libc::killpg(libc::getpid(), libc::SIGTERM); }
-            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            time::sleep(std::time::Duration::from_millis(60)).await;
             unsafe { libc::killpg(libc::getpid(), libc::SIGKILL); }
         }
         result.map_err(py_error)?;
