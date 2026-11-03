@@ -1,5 +1,5 @@
 use crate::python::{json_to_py, py_error, py_to_json};
-use kernmini::{DapClient, DapRequest, Error};
+use kernmini::{DapClient, DapRequest, Error, Result};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyModule};
@@ -7,7 +7,7 @@ use std::future::Future;
 use std::sync::Mutex;
 use std::time::Duration;
 
-fn runtime_block_on<F, T>(py: Python<'_>, future: F) -> PyResult<T> where F: Future<Output = kernmini::Result<T>> + Send, T: Send {
+fn runtime_block_on<F, T>(py: Python<'_>, future: F) -> PyResult<T> where F: Future<Output = Result<T>> + Send, T: Send {
     py.detach(|| pyo3_async_runtimes::tokio::get_runtime().block_on(future)).map_err(py_error)
 }
 

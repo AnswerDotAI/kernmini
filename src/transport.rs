@@ -1,3 +1,4 @@
+use crate::Result;
 use crate::wire::{Message, Session};
 use crate::{Error, ErrorKind};
 use bytes::Bytes;
@@ -11,13 +12,13 @@ use zmtpmini::{Incoming, Peer};
 /// The largest frame a client may send, such as a cell's code: 1 GiB. A larger frame breaks the connection it arrives on.
 const MAX_FRAME: usize = 1 << 30;
 
-struct SendRequest { frames: Vec<Bytes>, complete: oneshot::Sender<crate::Result<()>> }
+struct SendRequest { frames: Vec<Bytes>, complete: oneshot::Sender<Result<()>> }
 
 #[derive(Clone)]
 pub struct ReplySink { outgoing: mpsc::Sender<SendRequest>, closed: watch::Receiver<Option<Error>> }
 
 impl ReplySink {
-    pub async fn send(&self, frames: Vec<Bytes>) -> crate::Result<()> {
+    pub async fn send(&self, frames: Vec<Bytes>) -> Result<()> {
         let (complete, done) = oneshot::channel();
         tokio::select! {
             biased;
@@ -65,7 +66,7 @@ impl RouterPeers {
 
 pub struct Inbound { pub message: Message, pub reply: ReplySink, pub identity: Bytes }
 
-pub async fn serve_router(listener: TcpListener, session: Session, incoming: mpsc::Sender<Inbound>, peers: Option<RouterPeers>) -> crate::Result<()> {
+pub async fn serve_router(listener: TcpListener, session: Session, incoming: mpsc::Sender<Inbound>, peers: Option<RouterPeers>) -> Result<()> {
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {
@@ -78,12 +79,12 @@ pub async fn serve_router(listener: TcpListener, session: Session, incoming: mps
     }
 }
 
-fn peer_finished(result: Result<crate::Result<()>, JoinError>, channel: &str) -> crate::Result<()> {
+fn peer_finished(result: std::result::Result<Result<()>, JoinError>, channel: &str) -> Result<()> {
     if let Err(error) = result? && error.kind() != ErrorKind::Closed { eprintln!("{channel} peer ended: {error}"); }
     Ok(())
 }
 
-async fn router_peer(stream: TcpStream, session: Session, incoming: mpsc::Sender<Inbound>, peers: Option<RouterPeers>) -> crate::Result<()> {
+async fn router_peer(stream: TcpStream, session: Session, incoming: mpsc::Sender<Inbound>, peers: Option<RouterPeers>) -> Result<()> {
     let peer = Peer::router(stream).await?.with_max_frame(MAX_FRAME);
     let identity = Bytes::copy_from_slice(peer.identity().unwrap_or_default());
     let (mut reader, mut writer) = peer.split();
@@ -125,7 +126,7 @@ pub struct Iopub { peers: Arc<Mutex<Vec<mpsc::Sender<Vec<Bytes>>>>>, session: Se
 impl Iopub {
     pub fn new(session: Session, capacity: usize) -> Self { Self { peers: Arc::new(Mutex::new(vec![])), session, capacity } }
 
-    pub async fn publish(&self, message: Message) -> crate::Result<()> {
+    pub async fn publish(&self, message: Message) -> Result<()> {
         let frames = self.session.encode(&message)?;
         let mut peers = self.peers.lock().await;
         let mut i = 0;
@@ -133,7 +134,7 @@ impl Iopub {
         Ok(())
     }
 
-    pub async fn serve(self, listener: TcpListener) -> crate::Result<()> {
+    pub async fn serve(self, listener: TcpListener) -> Result<()> {
         let mut connections = JoinSet::new();
         loop {
             tokio::select! {
@@ -147,7 +148,7 @@ impl Iopub {
         }
     }
 
-    async fn peer(&self, stream: TcpStream) -> crate::Result<()> {
+    async fn peer(&self, stream: TcpStream) -> Result<()> {
         let peer = Peer::xpublisher(stream).await?.with_max_frame(MAX_FRAME);
         let (mut reader, mut writer) = peer.split();
         let (send, mut outgoing) = mpsc::channel::<Vec<Bytes>>(self.capacity);
@@ -174,7 +175,7 @@ impl Iopub {
     }
 }
 
-pub async fn serve_heartbeat(listener: TcpListener) -> crate::Result<()> {
+pub async fn serve_heartbeat(listener: TcpListener) -> Result<()> {
     let mut connections = JoinSet::new();
     loop {
         tokio::select! {

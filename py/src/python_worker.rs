@@ -1,6 +1,7 @@
 use crate::python::py_error;
-use kernmini::ThreadWorker;
+use kernmini::{Error, ThreadWorker};
 use pyo3::prelude::*;
+use std::thread::Builder;
 
 struct PythonState(Option<Py<PyAny>>);
 
@@ -16,11 +17,11 @@ impl PyThreadWorker {
     #[pyo3(signature = (factory, *, name="kernmini-interpreter", stack_size=None))]
     fn start<'py>(py: Python<'py>, factory: Py<PyAny>, name: &str, stack_size: Option<usize>) -> PyResult<Bound<'py, PyAny>> {
         let context = py.import("contextvars")?.call_method0("copy_context")?.unbind();
-        let mut builder = std::thread::Builder::new().name(name.to_owned());
+        let mut builder = Builder::new().name(name.to_owned());
         if let Some(size) = stack_size { builder = builder.stack_size(size); }
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let worker = ThreadWorker::start(builder, move || {
-                Python::attach(|py| context.call_method1(py, "run", (factory,)).map(|state| PythonState(Some(state)))).map_err(kernmini::Error::adapter)
+                Python::attach(|py| context.call_method1(py, "run", (factory,)).map(|state| PythonState(Some(state)))).map_err(Error::adapter)
             }).await.map_err(py_error)?;
             Python::attach(|py| Py::new(py, Self { worker }))
         })

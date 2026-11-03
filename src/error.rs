@@ -1,4 +1,7 @@
+use crate::WireError;
 use std::{error::Error as StdError, fmt, io, sync::Arc};
+use tokio::sync::mpsc::error::SendError;
+use tokio::task::JoinError;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -49,18 +52,16 @@ impl StdError for Error { fn source(&self) -> Option<&(dyn StdError + 'static)> 
 
 impl From<io::Error> for Error { fn from(error: io::Error) -> Self { Self::new(ErrorKind::Io, "I/O failed").caused_by(error) } }
 impl From<serde_json::Error> for Error { fn from(error: serde_json::Error) -> Self { Self::new(ErrorKind::InvalidInput, "invalid JSON").caused_by(error) } }
-impl From<crate::WireError> for Error {
-    fn from(error: crate::WireError) -> Self { Self::new(ErrorKind::Protocol, "invalid Jupyter message").caused_by(error) }
-}
+impl From<WireError> for Error { fn from(error: WireError) -> Self { Self::new(ErrorKind::Protocol, "invalid Jupyter message").caused_by(error) } }
 impl From<zmtpmini::Error> for Error {
     fn from(error: zmtpmini::Error) -> Self {
         let kind = match &error { zmtpmini::Error::Closed => ErrorKind::Closed, zmtpmini::Error::Io(_) => ErrorKind::Io, _ => ErrorKind::Protocol };
         Self::new(kind, "ZMTP connection failed").caused_by(error)
     }
 }
-impl<T> From<tokio::sync::mpsc::error::SendError<T>> for Error { fn from(_: tokio::sync::mpsc::error::SendError<T>) -> Self { Self::closed("kernel service") } }
+impl<T> From<SendError<T>> for Error { fn from(_: SendError<T>) -> Self { Self::closed("kernel service") } }
 impl From<tokio::sync::oneshot::error::RecvError> for Error {
     fn from(error: tokio::sync::oneshot::error::RecvError) -> Self { Self::closed("kernel service").caused_by(error) }
 }
 impl From<std::sync::mpsc::RecvError> for Error { fn from(error: std::sync::mpsc::RecvError) -> Self { Self::closed("kernel service").caused_by(error) } }
-impl From<tokio::task::JoinError> for Error { fn from(error: tokio::task::JoinError) -> Self { Self::closed("kernel task").caused_by(error) } }
+impl From<JoinError> for Error { fn from(error: JoinError) -> Self { Self::closed("kernel task").caused_by(error) } }

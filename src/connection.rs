@@ -1,3 +1,4 @@
+use crate::{Error, ErrorKind, Result};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -8,16 +9,16 @@ pub struct ConnectionInfo {
 }
 
 impl ConnectionInfo {
-    pub fn read(path: impl AsRef<Path>) -> crate::Result<Self> {
+    pub fn read(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let bytes = std::fs::read(path).map_err(|error| crate::Error::from(error).context(format!("reading {}", path.display())))?;
-        serde_json::from_slice(&bytes).map_err(|error| crate::Error::from(error).context(format!("parsing {}", path.display())))
+        let bytes = std::fs::read(path).map_err(|error| Error::from(error).context(format!("reading {}", path.display())))?;
+        serde_json::from_slice(&bytes).map_err(|error| Error::from(error).context(format!("parsing {}", path.display())))
     }
 
-    pub fn address(&self, port: u16) -> crate::Result<String> {
-        if self.transport != "tcp" { return Err(crate::Error::new(crate::ErrorKind::Unavailable, "only TCP connection files are supported")); }
+    pub fn address(&self, port: u16) -> Result<String> {
+        if self.transport != "tcp" { return Err(Error::new(ErrorKind::Unavailable, "only TCP connection files are supported")); }
         if self.signature_scheme != "hmac-sha256" {
-            return Err(crate::Error::new(crate::ErrorKind::Unavailable, format!("unsupported signature scheme {}", self.signature_scheme)));
+            return Err(Error::new(ErrorKind::Unavailable, format!("unsupported signature scheme {}", self.signature_scheme)));
         }
         Ok(format!("{}:{port}", self.ip))
     }

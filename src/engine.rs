@@ -1,11 +1,13 @@
+use crate::Result;
 use crate::language::{
     CompleteRequest, ContextMessage, ExecuteRequest, ExecutionContext, ExecutionInterrupt, InspectRequest, Language, LanguageEvent, LanguageMessage,
     LanguageSession, SessionCommand,
 };
-use crate::transport::{Inbound, Iopub, RouterPeers, serve_heartbeat, serve_router};
+use crate::transport::{Inbound, Iopub, ReplySink, RouterPeers, serve_heartbeat, serve_router};
 use crate::wire::{Message, Session};
 use crate::{ConnectionInfo, Error, ErrorKind};
 use bytes::Bytes;
+use mpsc::UnboundedSender;
 use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -17,6 +19,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::Instant;
 
 #[cfg(unix)]
 async fn termination_signal() {
@@ -47,18 +50,18 @@ impl KernelConfig {
     }
 }
 
-async fn send_iopub(iopub: &Iopub, session: &Session, parent: &Message, msg_type: &str, content: Value) -> crate::Result<()> {
+async fn send_iopub(iopub: &Iopub, session: &Session, parent: &Message, msg_type: &str, content: Value) -> Result<()> {
     iopub.publish(session.message(msg_type, content, Some(parent))).await
 }
 
-async fn send_reply(reply: &crate::transport::ReplySink, session: &Session, request: &Message, msg_type: &str, content: Value) -> crate::Result<()> {
+async fn send_reply(reply: &ReplySink, session: &Session, request: &Message, msg_type: &str, content: Value) -> Result<()> {
     if let Err(error) = reply.send(session.encode(&session.reply(request, msg_type, content))?).await {
         if error.kind() != ErrorKind::Closed { eprintln!("reply to disconnected client failed: {error}"); }
     }
     Ok(())
 }
 
-async fn status(iopub: &Iopub, session: &Session, parent: &Message, state: &str) -> crate::Result<()> {
+async fn status(iopub: &Iopub, session: &Session, parent: &Message, state: &str) -> Result<()> {
     send_iopub(iopub, session, parent, "status", json!({"execution_state": state})).await
 }
 
@@ -67,10 +70,10 @@ fn event_channel(capacity: usize) -> (mpsc::Sender<ContextMessage>, mpsc::Receiv
 #[derive(Clone)]
 struct Stdin { peers: RouterPeers, pending: Arc<Mutex<HashMap<String, PendingInput>>>, session: Session }
 
-struct PendingInput { identity: Bytes, complete: oneshot::Sender<crate::Result<String>> }
+struct PendingInput { identity: Bytes, complete: oneshot::Sender<Result<String>> }
 
 impl Stdin {
-    fn new(listener: TcpListener, session: Session, tasks: &mut JoinSet<crate::Result<()>>) -> Self {
+    fn new(listener: TcpListener, session: Session, tasks: &mut JoinSet<Result<()>>) -> Self {
         let peers = RouterPeers::default();
         let pending = Arc::new(Mutex::new(HashMap::<String, PendingInput>::new()));
         let (send, mut incoming) = mpsc::channel(64);
@@ -91,7 +94,7 @@ impl Stdin {
         Self { peers, pending, session }
     }
 
-    async fn request(&self, identity: &Bytes, parent: &Message, prompt: String, password: bool, interrupt: &ExecutionInterrupt) -> crate::Result<String> {
+    async fn request(&self, identity: &Bytes, parent: &Message, prompt: String, password: bool, interrupt: &ExecutionInterrupt) -> Result<String> {
         let message = self.session.message("input_request", json!({"prompt": prompt, "password": password}), Some(parent));
         let msg_id = message.msg_id().to_owned();
         let (complete, result) = oneshot::channel();
@@ -172,7 +175,7 @@ impl KernelServices {
     }
 }
 
-async fn publish_event(iopub: &Iopub, session: &Session, request: &Message, event: LanguageEvent, silent: bool) -> crate::Result<()> {
+async fn publish_event(iopub: &Iopub, session: &Session, request: &Message, event: LanguageEvent, silent: bool) -> Result<()> {
     match event {
         LanguageEvent::Stream { name, text } if !silent => { send_iopub(iopub, session, request, "stream", json!({"name": name, "text": text})).await?; }
         LanguageEvent::Display { event, buffers } if !silent => {
@@ -210,13 +213,12 @@ fn missing_fields(request: &Message) -> Vec<&'static str> {
     required.iter().copied().filter(|key| request.content.get(*key).is_none()).collect()
 }
 
-async fn reply_missing(
-    execution_count: u64, iopub: &Iopub, session: &Session, request: &Message, reply: &crate::transport::ReplySink, missing: &[&str]) -> crate::Result<()> {
+async fn reply_missing(execution_count: u64, iopub: &Iopub, session: &Session, request: &Message, reply: &ReplySink, missing: &[&str]) -> Result<()> {
     let content = error_content(request, execution_count, "MissingField", format!("missing required fields: {}", missing.join(", ")));
     reply_error(iopub, session, request, reply, content).await
 }
 
-async fn reply_error(iopub: &Iopub, session: &Session, request: &Message, reply: &crate::transport::ReplySink, content: Value) -> crate::Result<()> {
+async fn reply_error(iopub: &Iopub, session: &Session, request: &Message, reply: &ReplySink, content: Value) -> Result<()> {
     if request.msg_type() == "execute_request" {
         status(iopub, session, request, "busy").await?;
         send_iopub(iopub, session, request, "error", content.clone()).await?;
@@ -257,7 +259,7 @@ fn execute_request(content: &Value) -> ExecuteRequest {
 }
 async fn execute(
     services: &ShellServices<impl LanguageSession>, identity: Bytes, request: &Message, execute: ExecuteRequest, execution_count: u64,
-    interrupt: ExecutionInterrupt) -> crate::Result<(Value, bool)> {
+    interrupt: ExecutionInterrupt) -> Result<(Value, bool)> {
     let language = &services.language;
     let iopub = &services.shared.iopub;
     let session = &services.shared.session;
@@ -312,17 +314,17 @@ enum ShellOutcome { Continue, Shutdown }
 
 struct ExecutionDone { failed: bool, stop_on_error: bool }
 
-struct ActiveExecution { task: JoinHandle<crate::Result<ExecutionDone>>, interrupt: ExecutionInterrupt }
+struct ActiveExecution { task: JoinHandle<Result<ExecutionDone>>, interrupt: ExecutionInterrupt }
 
 impl Drop for ActiveExecution { fn drop(&mut self) { self.task.abort(); } }
 
-async fn wait_execution(active: &mut Option<ActiveExecution>) -> crate::Result<ExecutionDone> {
+async fn wait_execution(active: &mut Option<ActiveExecution>) -> Result<ExecutionDone> {
     if let Some(active) = active { (&mut active.task).await? } else { std::future::pending().await }
 }
 
 enum ShellControl { Release { msg_id: String, status: String, complete: oneshot::Sender<bool> }, Interrupt, Stop }
 
-async fn handle_shell(services: &ShellServices<impl LanguageSession>, inbound: Inbound, execution_count: u64) -> crate::Result<ShellOutcome> {
+async fn handle_shell(services: &ShellServices<impl LanguageSession>, inbound: Inbound, execution_count: u64) -> Result<ShellOutcome> {
     let language = &services.language;
     let iopub = &services.shared.iopub;
     let session = &services.shared.session;
@@ -401,7 +403,7 @@ async fn handle_shell(services: &ShellServices<impl LanguageSession>, inbound: I
 
 async fn run_execution(
     services: ShellServices<impl LanguageSession>, inbound: Inbound, execution: ExecuteRequest, execution_count: u64, interrupt: ExecutionInterrupt
-) -> crate::Result<ExecutionDone> {
+) -> Result<ExecutionDone> {
     let request = inbound.message;
     let stop_on_error = request.content.get("stop_on_error").and_then(Value::as_bool).unwrap_or(true);
     let (content, failed) = match execute(&services, inbound.identity, &request, execution, execution_count, interrupt).await {
@@ -418,8 +420,7 @@ async fn run_execution(
 }
 
 async fn report_failure(
-    services: &ShellServices<impl LanguageSession>, request: &Message, reply: &crate::transport::ReplySink, error: &Error, execution_count: u64
-) -> crate::Result<()> {
+    services: &ShellServices<impl LanguageSession>, request: &Message, reply: &ReplySink, error: &Error, execution_count: u64) -> Result<()> {
     let ename = if error.kind() == ErrorKind::Interrupted { "KeyboardInterrupt" } else { "KernelError" };
     let content = error_content(request, execution_count, ename, error.to_string());
     if request.msg_type() == "execute_request" { send_iopub(&services.shared.iopub, &services.shared.session, request, "error", content.clone()).await?; }
@@ -429,7 +430,7 @@ async fn report_failure(
     status(&services.shared.iopub, &services.shared.session, request, "idle").await
 }
 
-async fn abort_execute(execution_count: u64, iopub: &Iopub, session: &Session, inbound: Inbound) -> crate::Result<()> {
+async fn abort_execute(execution_count: u64, iopub: &Iopub, session: &Session, inbound: Inbound) -> Result<()> {
     let request = inbound.message;
     status(iopub, session, &request, "busy").await?;
     let content = json!({
@@ -440,7 +441,7 @@ async fn abort_execute(execution_count: u64, iopub: &Iopub, session: &Session, i
     status(iopub, session, &request, "idle").await
 }
 
-async fn interrupt_execute(execution_count: u64, iopub: &Iopub, session: &Session, inbound: Inbound) -> crate::Result<()> {
+async fn interrupt_execute(execution_count: u64, iopub: &Iopub, session: &Session, inbound: Inbound) -> Result<()> {
     let request = inbound.message;
     status(iopub, session, &request, "busy").await?;
     let content = json!({
@@ -453,7 +454,7 @@ async fn interrupt_execute(execution_count: u64, iopub: &Iopub, session: &Sessio
     status(iopub, session, &request, "idle").await
 }
 
-async fn begin_hold(execution_count: u64, iopub: &Iopub, session: &Session, item: &QueueItem) -> crate::Result<()> {
+async fn begin_hold(execution_count: u64, iopub: &Iopub, session: &Session, item: &QueueItem) -> Result<()> {
     let request = &item.inbound.message;
     status(iopub, session, request, "busy").await?;
     if !request.content.get("silent").and_then(Value::as_bool).unwrap_or(false) {
@@ -463,7 +464,7 @@ async fn begin_hold(execution_count: u64, iopub: &Iopub, session: &Session, item
     Ok(())
 }
 
-async fn finish_hold(execution_count: u64, iopub: &Iopub, session: &Session, item: QueueItem, release_status: &str) -> crate::Result<bool> {
+async fn finish_hold(execution_count: u64, iopub: &Iopub, session: &Session, item: QueueItem, release_status: &str) -> Result<bool> {
     let request = item.inbound.message;
     let error = match release_status {
         "error" => Some(json!({"ename": "HoldError", "evalue": "released with status error", "traceback": []})),
@@ -484,9 +485,9 @@ async fn finish_hold(execution_count: u64, iopub: &Iopub, session: &Session, ite
     Ok(failed)
 }
 
-struct Held { item: QueueItem, deadline: tokio::time::Instant }
+struct Held { item: QueueItem, deadline: Instant }
 
-async fn wait_hold(deadline: Option<tokio::time::Instant>) {
+async fn wait_hold(deadline: Option<Instant>) {
     if let Some(deadline) = deadline { tokio::time::sleep_until(deadline).await } else { std::future::pending().await }
 }
 
@@ -530,7 +531,7 @@ impl<L: LanguageSession> Shell<L> {
         self.execution_count
     }
 
-    async fn abort_pending(&mut self) -> crate::Result<()> {
+    async fn abort_pending(&mut self) -> Result<()> {
         while let Ok(inbound) = self.incoming.try_recv() { self.enqueue(inbound) }
         let mut keep = vec![];
         while let Some(item) = self.queue.pop() {
@@ -542,7 +543,7 @@ impl<L: LanguageSession> Shell<L> {
         Ok(())
     }
 
-    async fn apply_control(&mut self, control: ShellControl) -> crate::Result<()> {
+    async fn apply_control(&mut self, control: ShellControl) -> Result<()> {
         match control {
             ShellControl::Release { msg_id, status: release_status, complete } => {
                 let found = self.held.as_ref().is_some_and(|held| held.item.inbound.message.msg_id() == msg_id);
@@ -567,13 +568,13 @@ impl<L: LanguageSession> Shell<L> {
         Ok(())
     }
 
-    async fn execution_done(&mut self, done: ExecutionDone) -> crate::Result<()> {
+    async fn execution_done(&mut self, done: ExecutionDone) -> Result<()> {
         self.active.take();
         if done.failed && done.stop_on_error && !self.interrupting { self.abort_pending().await? }
         Ok(())
     }
 
-    async fn handle_item(&mut self, item: QueueItem) -> crate::Result<bool> {
+    async fn handle_item(&mut self, item: QueueItem) -> Result<bool> {
         if item.inbound.message.msg_type() != "execute_request" {
             let request = item.inbound.message.clone();
             let reply = item.inbound.reply.clone();
@@ -596,7 +597,7 @@ impl<L: LanguageSession> Shell<L> {
             self.abort_pending().await?;
         } else if item.inbound.message.metadata.get("hold").and_then(Value::as_bool).unwrap_or(false) {
             begin_hold(self.execution_count, &self.services.shared.iopub, &self.services.shared.session, &item).await?;
-            self.held = Some(Held { item, deadline: tokio::time::Instant::now() + self.services.shared.config.hold_timeout });
+            self.held = Some(Held { item, deadline: Instant::now() + self.services.shared.config.hold_timeout });
         } else {
             let interrupt = ExecutionInterrupt::default();
             let execution = execute_request(&item.inbound.message.content);
@@ -607,7 +608,7 @@ impl<L: LanguageSession> Shell<L> {
         Ok(false)
     }
 
-    async fn run(mut self) -> crate::Result<()> {
+    async fn run(mut self) -> Result<()> {
         loop {
             while let Ok(inbound) = self.incoming.try_recv() { self.enqueue(inbound) }
             while let Ok(control) = self.controls.try_recv() { self.apply_control(control).await? }
@@ -640,12 +641,12 @@ impl<L: LanguageSession> Shell<L> {
     }
 }
 
-struct ShellHandle { incoming: mpsc::Sender<Inbound>, controls: mpsc::Sender<ShellControl>, task: JoinHandle<crate::Result<()>> }
+struct ShellHandle { incoming: mpsc::Sender<Inbound>, controls: mpsc::Sender<ShellControl>, task: JoinHandle<Result<()>> }
 
 #[derive(Clone)]
 struct KernelServices {
     iopub: Iopub, stdin: Stdin, session: Session, connection: Arc<Value>, supports_subshells: bool, config: KernelConfig,
-    subshells: mpsc::UnboundedSender<SessionCommand>, failures: mpsc::UnboundedSender<Error>
+    subshells: UnboundedSender<SessionCommand>, failures: UnboundedSender<Error>
 }
 
 impl KernelServices {
@@ -659,7 +660,7 @@ impl KernelServices {
     }
 
     /// Stops `shell` without blocking the caller, then runs `done`. Code that ignores the interrupt can keep a shell running indefinitely.
-    fn stop_in_background(&self, shell: ShellHandle, interrupt: bool, done: impl Future<Output = crate::Result<()>> + Send + 'static) {
+    fn stop_in_background(&self, shell: ShellHandle, interrupt: bool, done: impl Future<Output = Result<()>> + Send + 'static) {
         let failures = self.failures.clone();
         tokio::spawn(async move {
             let result = async { stop_shell(shell, interrupt).await?; done.await }.await;
@@ -670,21 +671,21 @@ impl KernelServices {
 
 fn subshell_id(request: &Message) -> &str { request.header.get("subshell_id").and_then(Value::as_str).filter(|id| !id.is_empty()).unwrap_or("") }
 
-async fn reply_subshell_error(iopub: &Iopub, session: &Session, inbound: Inbound, ename: &str, evalue: String) -> crate::Result<()> {
+async fn reply_subshell_error(iopub: &Iopub, session: &Session, inbound: Inbound, ename: &str, evalue: String) -> Result<()> {
     let request = inbound.message;
     if !request.msg_type().ends_with("_request") { return Ok(()); }
     let content = error_content(&request, 0, ename, evalue);
     reply_error(iopub, session, &request, &inbound.reply, content).await
 }
 
-async fn reply_subshell_not_found(iopub: &Iopub, session: &Session, inbound: Inbound) -> crate::Result<()> {
+async fn reply_subshell_not_found(iopub: &Iopub, session: &Session, inbound: Inbound) -> Result<()> {
     let id = subshell_id(&inbound.message).to_owned();
     reply_subshell_error(iopub, session, inbound, "SubshellNotFound", format!("Unknown subshell_id {id:?}")).await
 }
 
 async fn route_shell<L: Language>(
     inbound: Inbound, language: &L, services: &KernelServices, shells: &mut HashMap<String, ShellHandle>, route_overrides: &HashMap<String, String>
-) -> crate::Result<()> {
+) -> Result<()> {
     let (iopub, session) = (&services.iopub, &services.session);
     let explicit = subshell_id(&inbound.message);
     let client_session = inbound.message.header.get("session").and_then(Value::as_str).unwrap_or("");
@@ -704,24 +705,24 @@ async fn route_shell<L: Language>(
 
 async fn route_pending_shells<L: Language>(
     shell: &mut mpsc::Receiver<Inbound>, language: &L, services: &KernelServices, shells: &mut HashMap<String, ShellHandle>,
-    route_overrides: &HashMap<String, String>) -> crate::Result<()> {
+    route_overrides: &HashMap<String, String>) -> Result<()> {
     while let Ok(inbound) = shell.try_recv() { route_shell(inbound, language, services, shells, route_overrides).await? }
     Ok(())
 }
 
-async fn stop_shell(shell: ShellHandle, interrupt: bool) -> crate::Result<()> {
+async fn stop_shell(shell: ShellHandle, interrupt: bool) -> Result<()> {
     if interrupt { let _ = shell.controls.send(ShellControl::Interrupt).await; }
     let _ = shell.controls.send(ShellControl::Stop).await;
     shell.task.await?
 }
 
-async fn interrupt_shells(shells: &HashMap<String, ShellHandle>) -> crate::Result<()> {
+async fn interrupt_shells(shells: &HashMap<String, ShellHandle>) -> Result<()> {
     for shell in shells.values() { shell.controls.send(ShellControl::Interrupt).await?; }
     Ok(())
 }
 
 async fn create_subshell(
-    language: &impl Language, services: &KernelServices, shells: &mut HashMap<String, ShellHandle>, requested_id: Option<String>) -> crate::Result<String> {
+    language: &impl Language, services: &KernelServices, shells: &mut HashMap<String, ShellHandle>, requested_id: Option<String>) -> Result<String> {
     let id = requested_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     if id.is_empty() { return Err(Error::new(ErrorKind::InvalidInput, "subshell_id cannot be empty")); }
     if !language.supports_children() { return Err(Error::new(ErrorKind::Unavailable, "subshells are not supported")); }
@@ -731,7 +732,7 @@ async fn create_subshell(
     Ok(id)
 }
 
-pub async fn run_kernel(connection_file: impl AsRef<Path>, language: impl Language) -> crate::Result<()> {
+pub async fn run_kernel(connection_file: impl AsRef<Path>, language: impl Language) -> Result<()> {
     let interrupt = KernelInterrupter::default();
     let signal_interrupt = interrupt.clone();
     let signals = tokio::spawn(async move { while tokio::signal::ctrl_c().await.is_ok() { signal_interrupt.interrupt() } });
@@ -742,11 +743,11 @@ pub async fn run_kernel(connection_file: impl AsRef<Path>, language: impl Langua
 
 /// Runs `run_kernel` on a new multi-threaded Tokio runtime, for a program that has none. The runtime awaits `language` first, so
 /// starting the language can use it, as `ThreadWorker::start` does.
-pub fn run_kernel_blocking<L: Language>(connection_file: impl AsRef<Path>, language: impl Future<Output = crate::Result<L>>) -> crate::Result<()> {
+pub fn run_kernel_blocking<L: Language>(connection_file: impl AsRef<Path>, language: impl Future<Output = Result<L>>) -> Result<()> {
     tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async { run_kernel(connection_file, language.await?).await })
 }
 
-pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, language: impl Language, interrupt: KernelInterrupter) -> crate::Result<()> {
+pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, language: impl Language, interrupt: KernelInterrupter) -> Result<()> {
     let config = KernelConfig::from_env();
     let connection = ConnectionInfo::read(connection_file)?;
     let connection_content = Arc::new(json!({
@@ -896,7 +897,7 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
                         });
                     } else {
                         send_reply(&reply, &session, &request, "delete_subshell_reply", json!({
-                            "status": "error", "ename": "SubshellNotFound", "evalue": format!("Unknown subshell_id {id:?}"), "traceback": []})).await?;
+                        "status": "error", "ename": "SubshellNotFound", "evalue": format!("Unknown subshell_id {id:?}"), "traceback": []})).await?;
                     }
                 }
                 "release_request" => {
@@ -946,9 +947,10 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Result;
 
     #[tokio::test]
-    async fn pending_input_lifetime() -> crate::Result<()> {
+    async fn pending_input_lifetime() -> Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let session = Session::new(b"test".to_vec(), "test");

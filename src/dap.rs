@@ -1,4 +1,5 @@
-use crate::{Error, ErrorKind};
+use crate::{Error, ErrorKind, Result};
+use mpsc::UnboundedSender;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,7 +9,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWri
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::sync::{mpsc, oneshot, watch};
 
-type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<crate::Result<Value>>>>>;
+type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
 
 struct DapInner { outgoing: mpsc::Sender<Vec<u8>>, pending: Pending, close: watch::Sender<Option<Error>>, next_seq: AtomicU64 }
 
@@ -17,10 +18,10 @@ impl Drop for DapInner { fn drop(&mut self) { fail_pending(&self.pending, &self.
 #[derive(Clone)]
 pub struct DapClient { inner: Arc<DapInner> }
 
-pub struct DapRequest { seq: u64, result: oneshot::Receiver<crate::Result<Value>>, pending: Pending }
+pub struct DapRequest { seq: u64, result: oneshot::Receiver<Result<Value>>, pending: Pending }
 
 impl DapClient {
-    pub async fn connect(address: impl ToSocketAddrs) -> crate::Result<(Self, mpsc::UnboundedReceiver<Value>)> {
+    pub async fn connect(address: impl ToSocketAddrs) -> Result<(Self, mpsc::UnboundedReceiver<Value>)> {
         let stream = TcpStream::connect(address).await?;
         let (reader, writer) = stream.into_split();
         let (outgoing, outgoing_rx) = mpsc::channel(64);
@@ -44,7 +45,7 @@ impl DapClient {
 
     fn next_sequence(&self) -> u64 { self.inner.next_seq.fetch_add(1, Ordering::AcqRel) }
 
-    fn request_sequence(&self, request: &mut Value) -> crate::Result<u64> {
+    fn request_sequence(&self, request: &mut Value) -> Result<u64> {
         let content = request.as_object_mut().ok_or_else(|| Error::new(ErrorKind::InvalidInput, "DAP request must be an object"))?;
         let seq = content.get("seq").and_then(Value::as_u64).filter(|seq| *seq > 0).unwrap_or_else(|| {
             let seq = self.next_sequence();
@@ -56,7 +57,7 @@ impl DapClient {
         Ok(seq)
     }
 
-    pub async fn send(&self, mut request: Value) -> crate::Result<DapRequest> {
+    pub async fn send(&self, mut request: Value) -> Result<DapRequest> {
         if let Some(error) = self.inner.close.borrow().as_ref() { return Err(error.clone()); }
         let seq = self.request_sequence(&mut request)?;
         let frame = encode_message(&request)?;
@@ -72,12 +73,12 @@ impl DapClient {
         Ok(request)
     }
 
-    pub async fn request(&self, request: Value, timeout: Duration) -> crate::Result<Value> { self.send(request).await?.wait(timeout).await }
+    pub async fn request(&self, request: Value, timeout: Duration) -> Result<Value> { self.send(request).await?.wait(timeout).await }
 
     pub fn close(&self) { fail_pending(&self.inner.pending, &self.inner.close, Error::closed("DAP client")); }
 }
 
-fn encode_message(message: &Value) -> crate::Result<Vec<u8>> {
+fn encode_message(message: &Value) -> Result<Vec<u8>> {
     let payload = serde_json::to_vec(message)?;
     let mut frame = format!("Content-Length: {}\r\n\r\n", payload.len()).into_bytes();
     frame.extend(payload);
@@ -87,7 +88,7 @@ fn encode_message(message: &Value) -> crate::Result<Vec<u8>> {
 impl DapRequest {
     pub fn sequence(&self) -> u64 { self.seq }
 
-    pub async fn wait(mut self, timeout: Duration) -> crate::Result<Value> {
+    pub async fn wait(mut self, timeout: Duration) -> Result<Value> {
         match tokio::time::timeout(timeout, &mut self.result).await {
             Ok(Ok(result)) => result, Ok(Err(error)) => Err(Error::closed("DAP connection").caused_by(error)),
             Err(error) => Err(Error::new(ErrorKind::TimedOut, format!("waiting for DAP request {}", self.seq)).caused_by(error))
@@ -109,8 +110,7 @@ fn fail_pending(pending: &Pending, close: &watch::Sender<Option<Error>>, error: 
     for (_, complete) in pending.lock().expect("DAP pending lock poisoned").drain() { let _ = complete.send(Err(error.clone())); }
 }
 
-async fn write_messages(
-    mut writer: impl AsyncWrite + Unpin, mut outgoing: mpsc::Receiver<Vec<u8>>, mut close: watch::Receiver<Option<Error>>) -> crate::Result<()> {
+async fn write_messages(mut writer: impl AsyncWrite + Unpin, mut outgoing: mpsc::Receiver<Vec<u8>>, mut close: watch::Receiver<Option<Error>>) -> Result<()> {
     loop {
         if close.borrow().is_some() { return Ok(()); }
         tokio::select! {
@@ -125,7 +125,7 @@ async fn write_messages(
     }
 }
 
-async fn read_message(reader: &mut (impl AsyncBufRead + Unpin)) -> crate::Result<Value> {
+async fn read_message(reader: &mut (impl AsyncBufRead + Unpin)) -> Result<Value> {
     let mut content_length = None;
     loop {
         let mut header = String::new();
@@ -143,7 +143,7 @@ async fn read_message(reader: &mut (impl AsyncBufRead + Unpin)) -> crate::Result
 }
 
 async fn read_messages(
-    reader: impl AsyncRead + Unpin, pending: Pending, events: mpsc::UnboundedSender<Value>, mut close: watch::Receiver<Option<Error>>) -> crate::Result<()> {
+    reader: impl AsyncRead + Unpin, pending: Pending, events: UnboundedSender<Value>, mut close: watch::Receiver<Option<Error>>) -> Result<()> {
     let mut reader = BufReader::new(reader);
     loop {
         if close.borrow().is_some() { return Ok(()); }

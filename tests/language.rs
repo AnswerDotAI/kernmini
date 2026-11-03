@@ -1,6 +1,7 @@
-use kernmini::{Error, ErrorKind, ExecutionInterrupt, ThreadWorker};
+use kernmini::{Error, ErrorKind, ExecutionInterrupt, Result, ThreadWorker};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread::Builder;
 
 #[test]
 fn execution_interrupt_story() {
@@ -25,20 +26,20 @@ fn execution_interrupt_story() {
 }
 
 #[tokio::test]
-async fn worker_errors_keep_their_meaning() -> kernmini::Result<()> {
+async fn worker_errors_keep_their_meaning() -> Result<()> {
     use std::error::Error as _;
     let error = Error::adapter(std::io::Error::from(std::io::ErrorKind::PermissionDenied)).context("starting interpreter");
-    let failed = ThreadWorker::<()>::start(std::thread::Builder::new(), move || Err(error)).await;
+    let failed = ThreadWorker::<()>::start(Builder::new(), move || Err(error)).await;
     let error = failed.err().unwrap();
     assert_eq!(error.kind(), ErrorKind::Adapter);
     assert_eq!(error.source().unwrap().source().unwrap().downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::PermissionDenied);
 
-    let worker = ThreadWorker::start(std::thread::Builder::new(), || Ok(())).await?;
+    let worker = ThreadWorker::start(Builder::new(), || Ok(())).await?;
     assert_eq!(worker.call(|_| Err::<(), _>("language error")).await?, Err("language error"));
     assert_eq!(worker.call(|_| panic!("interpreter crashed")).await.unwrap_err().kind(), ErrorKind::Closed);
     assert_eq!(worker.call(|_| ()).await.unwrap_err().kind(), ErrorKind::Closed);
 
-    let worker = ThreadWorker::start(std::thread::Builder::new(), || Ok(())).await?;
+    let worker = ThreadWorker::start(Builder::new(), || Ok(())).await?;
     worker.shutdown().await?;
     assert_eq!(worker.call(|_| ()).await.unwrap_err().kind(), ErrorKind::Closed);
     Ok(())

@@ -1,13 +1,15 @@
 use async_trait::async_trait;
 use kernmini::{
     CompleteRequest, DebugEventSender, Error, ErrorKind, ExecuteOutcome, ExecuteRequest, ExecutionContext, InspectRequest, KernelInfo, KernelInterrupter,
-    Language, LanguageError, LanguageEvent, LanguageMessage, LanguageSession, reply_defaults,
+    Language, LanguageError, LanguageEvent, LanguageMessage, LanguageSession, Result, reply_defaults,
 };
 use pyo3::exceptions::asyncio::CancelledError;
 use pyo3::exceptions::{PyKeyboardInterrupt, PyOSError, PyRuntimeError, PyTimeoutError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyString, PyTuple};
+use pyo3_async_runtimes::TaskLocals;
 use serde_json::{Value, json};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::thread::JoinHandle;
@@ -57,14 +59,12 @@ fn py_buffers(value: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<u8>>> {
 
 /// Runs `f` with the GIL on one of Tokio's blocking threads. A cell that holds the GIL then blocks only that thread, never the worker
 /// threads that serve heartbeats and control requests.
-async fn attach<T: Send + 'static>(f: impl FnOnce(Python<'_>) -> PyResult<T> + Send + 'static) -> kernmini::Result<T> {
+async fn attach<T: Send + 'static>(f: impl FnOnce(Python<'_>) -> PyResult<T> + Send + 'static) -> Result<T> {
     tokio::task::spawn_blocking(move || Python::attach(f)).await?.map_err(Error::adapter)
 }
 
 /// Runs `f` with the GIL from a synchronous method. Tokio first moves this worker thread's other tasks to another thread.
-fn attach_blocking<T>(f: impl FnOnce(Python<'_>) -> PyResult<T>) -> kernmini::Result<T> {
-    tokio::task::block_in_place(|| Python::attach(f)).map_err(Error::adapter)
-}
+fn attach_blocking<T>(f: impl FnOnce(Python<'_>) -> PyResult<T>) -> Result<T> { tokio::task::block_in_place(|| Python::attach(f)).map_err(Error::adapter) }
 
 fn thread_ident(py: Python<'_>) -> PyResult<libc::c_ulong> { py.import("threading")?.call_method0("get_ident")?.extract() }
 
@@ -79,7 +79,8 @@ fn signals(thread: libc::c_ulong) -> bool { cfg!(unix) && MAIN_THREAD.get() == S
 #[derive(Default)]
 struct UserCode {
     /// The thread running code inside `user_code()`, and how deeply `user_code()` blocks nest there.
-    thread: Option<libc::c_ulong>, depth: u32,
+    thread: Option<libc::c_ulong>,
+    depth: u32,
     /// An interrupt of the current execution that nothing has delivered yet.
     pending: bool,
     /// kernmini has sent SIGINT to the main thread, and the SIGINT handler hasn't run yet.
@@ -96,7 +97,7 @@ struct Delivery { hook: bool, task: Py<PyAny>, interrupts: Interrupts }
 impl Delivery {
     /// Handles one interrupt request on the engine's thread. The engine must never wait for the GIL. A separate thread does the work
     /// that needs it.
-    fn request(self: &Arc<Self>) -> kernmini::Result<()> {
+    fn request(self: &Arc<Self>) -> Result<()> {
         self.interrupts.interrupted.store(true, AtomicOrdering::Release);
         if !self.hook {
             let main = {
@@ -109,20 +110,22 @@ impl Delivery {
             #[cfg(unix)]
             if let Some(thread) = main {
                 let error = unsafe { libc::pthread_kill(thread as libc::pthread_t, libc::SIGINT) };
-                if error != 0 { return Err(Error::adapter(std::io::Error::from_raw_os_error(error))) }
+                if error != 0 { return Err(Error::adapter(std::io::Error::from_raw_os_error(error))); }
             }
         }
         let delivery = self.clone();
-        std::thread::spawn(move || Python::attach(|py| {
-            if let Err(error) = delivery.deliver(py) { eprintln!("kernmini: interrupt delivery failed: {error}") }
-        }));
+        std::thread::spawn(move || {
+            Python::attach(|py| {
+                if let Err(error) = delivery.deliver(py) { eprintln!("kernmini: interrupt delivery failed: {error}") }
+            })
+        });
         Ok(())
     }
 
     /// Calls the shell's `interrupt()` hook if it has one. Otherwise it injects `KeyboardInterrupt` into user code on a subshell's
     /// thread. It also asks the event loop to cancel the task for an interrupt that user code never receives.
     fn deliver(&self, py: Python<'_>) -> PyResult<()> {
-        if self.hook { self.interrupts.target.call_method0(py, "interrupt")?; return Ok(()) }
+        if self.hook { self.interrupts.target.call_method0(py, "interrupt")?; return Ok(()); }
         let thread = {
             let mut code = lock(&self.interrupts.code);
             match code.thread { Some(thread) if code.pending && !signals(thread) => { code.pending = false; Some(thread) } _ => None }
@@ -149,7 +152,7 @@ struct DeferredCancel { task: Py<PyAny>, code: SharedUserCode }
 #[pymethods]
 impl DeferredCancel {
     fn __call__(&self, py: Python<'_>) -> PyResult<()> {
-        if self.task.bind(py).call_method0("done")?.is_truthy()? { return Ok(()) }
+        if self.task.bind(py).call_method0("done")?.is_truthy()? { return Ok(()); }
         let cancel = { let mut code = lock(&self.code); code.thread.is_none() && std::mem::take(&mut code.pending) };
         if cancel { self.task.call_method0(py, "cancel")?; }
         Ok(())
@@ -158,7 +161,7 @@ impl DeferredCancel {
 
 /// What an execution's sink needs to deliver its interrupts.
 #[derive(Clone)]
-struct Interrupts { target: Arc<Py<PyAny>>, locals: pyo3_async_runtimes::TaskLocals, code: SharedUserCode, interrupted: Arc<AtomicBool> }
+struct Interrupts { target: Arc<Py<PyAny>>, locals: TaskLocals, code: SharedUserCode, interrupted: Arc<AtomicBool> }
 
 #[pyclass]
 struct ExecutionSink { context: ExecutionContext, interrupts: Option<Interrupts> }
@@ -178,7 +181,7 @@ impl ExecutionSink {
         let Some(interrupts) = &self.interrupts else { return Ok(()) };
         let thread = thread_ident(py)?;
         let mut code = lock(&interrupts.code);
-        if std::mem::take(&mut code.pending) { return Err(PyKeyboardInterrupt::new_err("")) }
+        if std::mem::take(&mut code.pending) { return Err(PyKeyboardInterrupt::new_err("")); }
         if code.depth == 0 { code.thread = Some(thread) }
         code.depth += 1;
         Ok(())
@@ -190,7 +193,7 @@ impl ExecutionSink {
         let thread = {
             let mut code = lock(&interrupts.code);
             code.depth -= 1;
-            if code.depth > 0 { return }
+            if code.depth > 0 { return; }
             code.thread.take()
         };
         // A `KeyboardInterrupt` injected as the block ended may not have fired yet. It would fire outside user code.
@@ -253,11 +256,7 @@ impl SignalRouter {
             let mut code = lock(&self.code);
             std::mem::take(&mut code.woken).then(|| code.thread.is_some() && std::mem::take(&mut code.pending))
         };
-        match raise {
-            None => self.interrupt.interrupt(),
-            Some(true) => return Err(PyKeyboardInterrupt::new_err("")),
-            Some(false) => {}
-        }
+        match raise { None => self.interrupt.interrupt(), Some(true) => return Err(PyKeyboardInterrupt::new_err("")), Some(false) => {} }
         Ok(())
     }
 }
@@ -282,7 +281,7 @@ impl ChildLoop {
         });
     }
 
-    async fn shutdown(&self) -> kernmini::Result<()> {
+    async fn shutdown(&self) -> Result<()> {
         self.stop();
         let thread = self.thread.lock().expect("child thread lock poisoned").take();
         if let Some(thread) = thread {
@@ -303,7 +302,7 @@ impl Drop for ChildLoop {
 }
 
 #[derive(Clone)]
-struct PyLanguageSession { target: Arc<Py<PyAny>>, locals: pyo3_async_runtimes::TaskLocals, code: SharedUserCode, _child_loop: Option<Arc<ChildLoop>> }
+struct PyLanguageSession { target: Arc<Py<PyAny>>, locals: TaskLocals, code: SharedUserCode, _child_loop: Option<Arc<ChildLoop>> }
 
 impl PyLanguageSession {
     fn new(py: Python<'_>, target: Py<PyAny>) -> PyResult<Self> {
@@ -311,12 +310,12 @@ impl PyLanguageSession {
         Self::with_locals(py, target, locals, None)
     }
 
-    fn with_locals(py: Python<'_>, target: Py<PyAny>, locals: pyo3_async_runtimes::TaskLocals, child_loop: Option<Arc<ChildLoop>>) -> PyResult<Self> {
+    fn with_locals(py: Python<'_>, target: Py<PyAny>, locals: TaskLocals, child_loop: Option<Arc<ChildLoop>>) -> PyResult<Self> {
         py.import("kernmini._bridge")?.call_method1("bind_shell", (target.bind(py),))?;
         Ok(Self { target: Arc::new(target), locals, code: SharedUserCode::default(), _child_loop: child_loop })
     }
 
-    async fn request(&self, method: &'static str, content: Value) -> kernmini::Result<Option<Value>> {
+    async fn request(&self, method: &'static str, content: Value) -> Result<Option<Value>> {
         let (target, locals) = (self.target.clone(), self.locals.clone());
         let future = attach(move |py| {
             let awaitable = py.import("kernmini._bridge")?.call_method1("request", (target.bind(py), method, json_to_py(py, &content)?))?;
@@ -327,7 +326,7 @@ impl PyLanguageSession {
     }
 }
 
-type SessionReady = Arc<Mutex<Option<tokio::sync::oneshot::Sender<kernmini::Result<PyLanguageSession>>>>>;
+type SessionReady = Arc<Mutex<Option<tokio::sync::oneshot::Sender<Result<PyLanguageSession>>>>>;
 
 #[pyclass]
 struct ChildReady { created: SessionReady, child_loop: Weak<ChildLoop> }
@@ -337,7 +336,7 @@ impl ChildReady {
     fn __call__(&self, py: Python<'_>, event_loop: Py<PyAny>, target: Py<PyAny>) -> PyResult<()> {
         let child_loop = self.child_loop.upgrade().ok_or_else(|| py_error(Error::closed("child Python session during startup")))?;
         *child_loop.event_loop.lock().expect("child loop lock poisoned") = Some(event_loop.clone_ref(py));
-        let locals = pyo3_async_runtimes::TaskLocals::new(event_loop.bind(py).clone()).copy_context(py)?;
+        let locals = TaskLocals::new(event_loop.bind(py).clone()).copy_context(py)?;
         let session = PyLanguageSession::with_locals(py, target, locals, Some(child_loop))?;
         if self.created.lock().expect("child startup lock poisoned").take().unwrap().send(Ok(session)).is_err() { event_loop.call_method0(py, "stop")?; }
         Ok(())
@@ -354,7 +353,7 @@ impl Language for PyLanguage {
 
     fn supports_children(&self) -> bool { true }
 
-    async fn create_child(&self) -> kernmini::Result<Self::Session> {
+    async fn create_child(&self) -> Result<Self::Session> {
         let (factory, loop_factory) = (self.factory.clone(), self.loop_factory.clone());
         let child_loop = Arc::new(ChildLoop::new());
         let thread_loop = Arc::downgrade(&child_loop);
@@ -377,7 +376,7 @@ impl Language for PyLanguage {
 
 #[async_trait]
 impl LanguageSession for PyLanguageSession {
-    fn kernel_info(&self) -> kernmini::Result<KernelInfo> {
+    fn kernel_info(&self) -> Result<KernelInfo> {
         attach_blocking(|py| {
             let value = py_to_json(py, self.target.call_method0(py, "kernel_info")?.bind(py))?;
             Ok(KernelInfo { implementation: value["implementation"].as_str().unwrap_or("python").to_owned(),
@@ -387,13 +386,13 @@ impl LanguageSession for PyLanguageSession {
     }
 
     fn supported_features(&self) -> Vec<String> {
-        attach_blocking(|py| py_to_json(py, self.target.call_method0(py, "kernel_info")?.bind(py)))
-            .ok().and_then(|value| serde_json::from_value(value["supported_features"].clone()).ok()).unwrap_or_default()
+        attach_blocking(|py| py_to_json(py, self.target.call_method0(py, "kernel_info")?.bind(py))).ok()
+            .and_then(|value| serde_json::from_value(value["supported_features"].clone()).ok()).unwrap_or_default()
     }
 
     fn supports_debugger(&self) -> bool { attach_blocking(|py| self.target.bind(py).hasattr("debug_request")).unwrap_or(false) }
 
-    fn set_debug_sender(&self, sender: DebugEventSender) -> kernmini::Result<()> {
+    fn set_debug_sender(&self, sender: DebugEventSender) -> Result<()> {
         attach_blocking(|py| {
             if self.target.bind(py).hasattr("debugger")? {
                 self.target.getattr(py, "debugger")?.setattr(py, "event_callback", Py::new(py, DebugRouter { sender })?)?;
@@ -402,7 +401,7 @@ impl LanguageSession for PyLanguageSession {
         })
     }
 
-    fn set_kernel_context(&self, context: ExecutionContext) -> kernmini::Result<()> {
+    fn set_kernel_context(&self, context: ExecutionContext) -> Result<()> {
         attach_blocking(|py| {
             let sink = Py::new(py, ExecutionSink { context, interrupts: None })?;
             py.import("kernmini._bridge")?.call_method1("set_kernel_sink", (sink,))?;
@@ -410,7 +409,7 @@ impl LanguageSession for PyLanguageSession {
         })
     }
 
-    async fn execute(&self, request: ExecuteRequest, context: ExecutionContext) -> kernmini::Result<ExecuteOutcome> {
+    async fn execute(&self, request: ExecuteRequest, context: ExecutionContext) -> Result<ExecuteOutcome> {
         let interrupted = Arc::new(AtomicBool::new(false));
         let interrupts = Interrupts { target: self.target.clone(), locals: self.locals.clone(), code: self.code.clone(), interrupted: interrupted.clone() };
         let (target, locals, sink_context) = (self.target.clone(), self.locals.clone(), context.clone());
@@ -456,27 +455,25 @@ impl LanguageSession for PyLanguageSession {
             payload: value.get("payload").cloned().unwrap_or_else(|| json!([])) })
     }
 
-    async fn complete(&self, request: CompleteRequest) -> kernmini::Result<Value> {
+    async fn complete(&self, request: CompleteRequest) -> Result<Value> {
         Ok(self.request("complete", json!({"code": request.code, "cursor_pos": request.cursor_pos})).await?
             .unwrap_or_else(|| reply_defaults::complete(request.cursor_pos)))
     }
 
-    async fn inspect(&self, request: InspectRequest) -> kernmini::Result<Value> {
+    async fn inspect(&self, request: InspectRequest) -> Result<Value> {
         Ok(self.request("inspect", json!({"code": request.code, "cursor_pos": request.cursor_pos, "detail_level": request.detail_level})).await?
             .unwrap_or_else(reply_defaults::inspect))
     }
 
-    async fn is_complete(&self, code: String) -> kernmini::Result<Value> {
+    async fn is_complete(&self, code: String) -> Result<Value> {
         Ok(self.request("is_complete", json!({"code": code})).await?.unwrap_or_else(reply_defaults::is_complete))
     }
 
-    async fn history(&self, request: Value) -> kernmini::Result<Value> { Ok(self.request("history", request).await?.unwrap_or_else(reply_defaults::history)) }
+    async fn history(&self, request: Value) -> Result<Value> { Ok(self.request("history", request).await?.unwrap_or_else(reply_defaults::history)) }
 
-    async fn comm_info(&self, request: Value) -> kernmini::Result<Value> {
-        Ok(self.request("comm_info", request).await?.unwrap_or_else(reply_defaults::comm_info))
-    }
+    async fn comm_info(&self, request: Value) -> Result<Value> { Ok(self.request("comm_info", request).await?.unwrap_or_else(reply_defaults::comm_info)) }
 
-    async fn debug(&self, request: Value) -> kernmini::Result<Value> {
+    async fn debug(&self, request: Value) -> Result<Value> {
         if !self.supports_debugger() { return Ok(reply_defaults::debug()); }
         let target = self.target.clone();
         attach(move |py| {
@@ -485,7 +482,7 @@ impl LanguageSession for PyLanguageSession {
         }).await
     }
 
-    async fn message(&self, message: LanguageMessage, context: ExecutionContext) -> kernmini::Result<()> {
+    async fn message(&self, message: LanguageMessage, context: ExecutionContext) -> Result<()> {
         let (target, locals) = (self.target.clone(), self.locals.clone());
         let future = attach(move |py| {
             let sink = Py::new(py, ExecutionSink { context, interrupts: None })?;
@@ -498,7 +495,7 @@ impl LanguageSession for PyLanguageSession {
         Ok(())
     }
 
-    async fn shutdown(&self) -> kernmini::Result<()> {
+    async fn shutdown(&self) -> Result<()> {
         let (target, locals) = (self.target.clone(), self.locals.clone());
         let future = attach(move |py| {
             let awaitable = py.import("kernmini._bridge")?.call_method1("shutdown", (target.bind(py),))?;
@@ -555,8 +552,8 @@ fn run_kernel<'py>(
 #[pyo3(signature = (name, argv, display_name, language, user=true, prefix=None, **spec_kw))]
 #[allow(clippy::too_many_arguments)]
 fn install_kernelspec(
-    py: Python<'_>, name: &str, argv: Vec<String>, display_name: &str, language: &str, user: bool, prefix: Option<std::path::PathBuf>,
-    spec_kw: Option<&Bound<'_, PyDict>>) -> PyResult<std::path::PathBuf> {
+    py: Python<'_>, name: &str, argv: Vec<String>, display_name: &str, language: &str, user: bool, prefix: Option<PathBuf>, spec_kw: Option<&Bound<'_, PyDict>>
+) -> PyResult<PathBuf> {
     let _ = user; // Kept for compatibility: installs go under `prefix`, or else to the user data directory.
     let extra = match spec_kw.map(|kw| py_to_json(py, kw.as_any())).transpose()? { Some(Value::Object(map)) => map, _ => serde_json::Map::new() };
     kernmini::install_kernelspec(name, &argv, display_name, language, extra, prefix.as_deref()).map_err(py_error)
@@ -565,7 +562,7 @@ fn install_kernelspec(
 /// Copy an existing kernelspec directory (kernel.json plus any assets) into place; returns the destination.
 #[pyfunction]
 #[pyo3(signature = (src_dir, name, user=true, prefix=None))]
-fn install_kernelspec_dir(src_dir: std::path::PathBuf, name: &str, user: bool, prefix: Option<std::path::PathBuf>) -> PyResult<std::path::PathBuf> {
+fn install_kernelspec_dir(src_dir: PathBuf, name: &str, user: bool, prefix: Option<PathBuf>) -> PyResult<PathBuf> {
     let _ = user; // Kept for compatibility: installs go under `prefix`, or else to the user data directory.
     kernmini::install_kernelspec_dir(&src_dir, name, prefix.as_deref()).map_err(py_error)
 }
