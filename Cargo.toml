@@ -20,6 +20,14 @@ description = "Everything a Jupyter kernel needs except the language"
 repository = "https://github.com/AnswerDotAI/kernmini"
 include = ["/src/**", "/LICENSE", "/README.md"]
 
+[lib]
+test = false
+doctest = false
+
+[[bin]]
+name = "kernmini-echo"
+path = "src/bin/kernmini-echo.rs"
+test = false
 [dependencies]
 async-trait.workspace = true
 bytes = "1"
