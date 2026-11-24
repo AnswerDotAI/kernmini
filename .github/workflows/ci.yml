@@ -18,10 +18,11 @@ jobs:
       - uses: AnswerDotAI/.github/actions/sccache@main
         with:
           r2-url: ${{ secrets.SCCACHE_R2 }}
+      - uses: AnswerDotAI/.github/actions/setup-uv@main
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install -e '.[dev]'
+      - run: uv pip install --system -e '.[test]'
       - run: pytest -q --ignore=tests/test_ipymini.py
 
   rust:
@@ -41,14 +42,17 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
       - uses: AnswerDotAI/.github/actions/sccache@main
-        if: runner.os != 'Linux'
         with:
           r2-url: ${{ secrets.SCCACHE_R2 }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
       - uses: PyO3/maturin-action@v1
         with:
-          args: --profile dist --out dist -i python3.11 -i python3.12 -i python3.13 -i python3.14
-          manylinux: auto
+          args: --profile dist --out dist ${{ runner.os == 'Linux' && '--zig' || '' }}
+          manylinux: '2_31'
       - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.os }}
@@ -58,7 +62,6 @@ jobs:
     strategy:
       matrix:
         os: [windows-latest, windows-11-arm]
-        python-version: ['3.11', '3.12', '3.13', '3.14']
         include:
           - os: windows-latest
             architecture: x64
@@ -69,13 +72,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
       - uses: AnswerDotAI/.github/actions/sccache@main
         if: matrix.os != 'windows-11-arm'
         with:
           r2-url: ${{ secrets.SCCACHE_R2 }}
       - uses: actions/setup-python@v7
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: '3.13'
           architecture: ${{ matrix.architecture }}
       - uses: PyO3/maturin-action@v1
         with:
@@ -83,7 +87,7 @@ jobs:
           args: --profile dist --out dist -i python
       - uses: actions/upload-artifact@v7
         with:
-          name: wheels-${{ matrix.os }}-${{ matrix.python-version }}
+          name: wheels-${{ matrix.os }}
           path: dist
 
   sdist:

@@ -18,19 +18,22 @@ classifiers = [
 dependencies = ["fastcore>=2.2.17"]
 
 [project.optional-dependencies]
-dev = [
-  "fastws-cli>=0.0.20",
+test = [
   "conkernelclient>=0.0.23",
   "debugpy>=1.8.21",
-  "fastship>=0.0.11",
   "jupywire>=0.0.1",
   "loopmini>=0.2.0",
-  "maturin>=1.0,<2.0",
   "pytest>=9.1.1",
   "pytest-asyncio",
   "pytest-timeout",
   "pytest-xdist",
   "pyzmq>=27.2.0",
+]
+dev = [
+  "fastws-cli>=0.0.20",
+  "fastship>=0.0.11",
+  "maturin>=1.0,<2.0",
+  "kernmini[test]",
 ]
 
 [project.urls]

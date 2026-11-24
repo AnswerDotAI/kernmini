@@ -13,7 +13,7 @@ doctest = false
 kernmini = { path = ".." }
 async-trait.workspace = true
 libc = "0.2"
-pyo3 = { version = "0.29", features = ["extension-module"] }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py311"] }
 pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 serde_json.workspace = true
 tokio.workspace = true
