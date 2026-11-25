@@ -22,7 +22,8 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
-      - run: uv pip install --system -e '.[test]'
+      - run: uv pip install --system --config-settings-package kernmini:metadata-only=1 -e '.[test]'
+      - run: cargo develop
       - run: pytest -q --ignore=tests/test_ipymini.py
 
   rust:
@@ -33,7 +34,7 @@ jobs:
       - uses: AnswerDotAI/.github/actions/sccache@main
         with:
           r2-url: ${{ secrets.SCCACHE_R2 }}
-      - run: cargo test -p kernmini
+      - run: cargo test --release -p kernmini
 
   build:
     strategy:
@@ -49,7 +50,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
-      - uses: PyO3/maturin-action@v1
+      - uses: AnswerDotAI/.github/actions/maturin-build@main
         with:
           args: --profile dist --out dist ${{ runner.os == 'Linux' && '--zig' || '' }}
           manylinux: '2_31'
@@ -81,7 +82,7 @@ jobs:
         with:
           python-version: '3.13'
           architecture: ${{ matrix.architecture }}
-      - uses: PyO3/maturin-action@v1
+      - uses: AnswerDotAI/.github/actions/maturin-build@main
         with:
           target: ${{ matrix.target }}
           args: --profile dist --out dist -i python
@@ -94,7 +95,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: PyO3/maturin-action@v1
+      - uses: AnswerDotAI/.github/actions/maturin-build@main
         with:
           command: sdist
           args: -o dist
