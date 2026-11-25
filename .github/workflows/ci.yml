@@ -35,6 +35,7 @@ jobs:
         with:
           r2-url: ${{ secrets.SCCACHE_R2 }}
       - run: cargo test --release -p kernmini
+      - run: cargo package -p kernmini
 
   build:
     strategy:
@@ -104,7 +105,22 @@ jobs:
           name: wheels-sdist
           path: dist
 
-  publish:
+  publish-crate:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, rust]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - run: cargo publish -p kernmini --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  publish-pypi:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [test, rust, build, windows, sdist]
     runs-on: ubuntu-latest
@@ -112,13 +128,6 @@ jobs:
       id-token: write
       contents: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - id: crates-auth
-        uses: rust-lang/crates-io-auth-action@v1
-      - run: cargo publish -p kernmini --no-verify
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
       - uses: actions/download-artifact@v8
         with:
           path: dist
