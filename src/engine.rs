@@ -913,6 +913,19 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
                     let content = json!({"status": "ok", "found": found});
                     send_reply(&reply, &session, &request, "release_reply", content).await?;
                 }
+                "set_env_request" => {
+                    let content = match parse_env(&request.content) {
+                        Ok(env) => match control_language.set_env(env).await {
+                            Ok(()) => json!({"status": "ok"}),
+                            Err(error) => {
+                                let ename = if error.kind() == ErrorKind::Unavailable { "SetEnvNotSupported" } else { "SetEnvError" };
+                                json!({"status": "error", "ename": ename, "evalue": error.to_string(), "traceback": []})
+                            }
+                        },
+                        Err(msg) => json!({"status": "error", "ename": "InvalidInput", "evalue": msg, "traceback": []}),
+                    };
+                    send_reply(&reply, &session, &request, "set_env_reply", content).await?;
+                }
                 "debug_request" => {
                     status(&iopub, &session, &request, "busy").await?;
                     let result = control_language.debug(request.content.clone()).await.unwrap_or_else(|error| {
@@ -942,4 +955,20 @@ pub async fn run_kernel_with_interrupter(connection_file: impl AsRef<Path>, lang
     }
     background.shutdown().await;
     result
+}
+
+fn parse_env(content: &Value) -> std::result::Result<HashMap<String, Option<String>>, String> {
+    let Some(obj) = content.get("env").and_then(Value::as_object) else {
+        return Err("set_env_request requires an 'env' object".into());
+    };
+    let mut env = HashMap::with_capacity(obj.len());
+    for (k, v) in obj {
+        let val = match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Null => None,
+            _ => return Err(format!("env value for {k:?} must be a string or null")),
+        };
+        env.insert(k.clone(), val);
+    }
+    Ok(env)
 }

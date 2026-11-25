@@ -129,6 +129,12 @@ async def test_python_adapter_story():
     async with run_kernel('echo', ECHO_ARGV) as (_, kc):
         await echo_kernel_story(kc, ['kernel subshells'], binary=True)
         await execution_queue_story(kc)
+        assert (await kc.ctl.set_env(env=dict(KERNMINI_TEST_ENV='updated'), timeout=5))['content']['status'] == 'ok'
+        assert _one(await _run(kc, 'env:KERNMINI_TEST_ENV'), 'execute_result')['content']['data']['text/plain'] == "'updated'"
+        assert (await kc.ctl.set_env(env=dict(KERNMINI_TEST_ENV=None), timeout=5))['content']['status'] == 'ok'
+        assert _one(await _run(kc, 'env:KERNMINI_TEST_ENV'), 'execute_result')['content']['data']['text/plain'] == 'None'
+        bad = await kc.ctl.set_env(env=dict(KERNMINI_TEST_ENV=123), timeout=5)
+        assert (bad['content']['status'], bad['content']['ename']) == ('error', 'InvalidInput')
 
 
 @pytest.mark.asyncio

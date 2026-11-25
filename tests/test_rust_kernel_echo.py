@@ -34,3 +34,5 @@ async def test_rust_language_story():
         assert next(m for m in messages if m['msg_type']=='execute_reply')['content']['ename'] == 'KernelError'
         assert messages[-1]['content']['execution_state'] == 'idle'
         assert (await kc.reply('still here', timeout=5))['content']['status'] == 'ok'
+        unsupported = await kc.ctl.set_env(env=dict(KERNMINI_TEST_ENV='1'), timeout=5)
+        assert (unsupported['content']['status'], unsupported['content']['ename']) == ('error', 'SetEnvNotSupported')

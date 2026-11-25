@@ -154,6 +154,10 @@ async def test_ipython_story():
         assert states == ['busy', 'idle']
         missing = await kc.shell_request('complete_request', timeout=5)
         assert missing['content']['status'] == 'error' and missing['content']['matches'] == []
+        assert (await kc.ctl.set_env(env=dict(KERNMINI_TEST_ENV='from-ipymini'), timeout=5))['content']['status'] == 'ok'
+        assert _one(await _run(kc, "import os; os.environ.get('KERNMINI_TEST_ENV', 'missing')"), 'execute_result')['content']['data']['text/plain'] == "'from-ipymini'"
+        assert (await kc.ctl.set_env(env=dict(KERNMINI_TEST_ENV=None), timeout=5))['content']['status'] == 'ok'
+        assert _one(await _run(kc, "os.environ.get('KERNMINI_TEST_ENV', 'missing')"), 'execute_result')['content']['data']['text/plain'] == "'missing'"
 
 
 if __name__ == "__main__":

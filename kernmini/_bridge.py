@@ -116,6 +116,11 @@ async def shutdown(target):
         if inspect.isawaitable(result): await result
 
 
+async def set_env(target, env):
+    result = target.set_env(env)
+    if inspect.isawaitable(result): await result
+
+
 async def message(target, sink, msg_type, content, buffers):
     token = _current.set(sink)
     try:

@@ -1,6 +1,6 @@
 "The minimal Python language adapter used by kernmini's client-driven tests."
 
-import sys
+import os, sys
 from contextlib import contextmanager
 
 from kernmini import run_kernel
@@ -9,6 +9,11 @@ from kernmini import run_kernel
 class EchoShell:
     def __init__(self, request_input=None, **kw): self._stream = None
     def set_stream_sender(self, sender): self._stream = sender
+
+    async def set_env(self, env):
+        for k, v in env.items():
+            if v is None: os.environ.pop(k, None)
+            else: os.environ[k] = v
 
     @contextmanager
     def execution_context(self, allow_stdin, silent): yield
@@ -24,6 +29,7 @@ class EchoShell:
             await asyncio.sleep(float(code[6:]))
         if code == "boom": return dict(error=dict(ename="EchoError", evalue=code, traceback=[]))
         if code == "bytes": return dict(result={"image/png": b"raw"})
+        if code.startswith("env:"): return dict(result={"text/plain": repr(os.environ.get(code[4:]))})
         return dict(result={"text/plain": code.upper()})
 
 

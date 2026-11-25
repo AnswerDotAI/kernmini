@@ -76,6 +76,7 @@ The adapter uses optional capabilities when present:
 - `comm_manager`, when exposed by the shell, is available through the kernel proxy passed to `bind_kernel`.
 - `interrupt()` is a synchronous native-language interrupt hook, called on a thread of its own instead of cancelling Python execution. It must be thread-safe and return promptly; it should signal the interpreter, not queue behind its execution.
 - `shutdown()` runs on the shell's owning loop before that loop stops. It may be synchronous or awaitable.
+- `set_env(env)` updates environment variables from a `set_env_request` dict mapping names to string values or `None`. It may be synchronous or awaitable; omitting it replies `SetEnvNotSupported`.
 
 Python adapters for synchronous native interpreters can use the same `ThreadWorker` as Rust:
 
@@ -119,6 +120,8 @@ Two execute metadata extensions are supported:
 An explicit `subshell_id` on a shell request creates that named subshell when missing, then routes the request there. `create_subshell_request` also accepts an optional `subshell_id`; a supplied ID makes explicit creation idempotent. Python code can use `kernmini.subshell()` to route later requests from its client session through a temporary child, or `kernmini.sidecar()` to route through the persistent named `sidecar` subshell.
 
 `delete_subshell_request` interrupts the subshell, then replies once its active execution has ended. Leaving `kernmini.subshell()` deletes its temporary subshell the same way, without the interrupt. The control channel keeps serving other requests while a deletion waits. Code that ignores the interrupt delays only its own deletion.
+
+Control `set_env_request` takes `{"env": {"KEY": "val" | null}}`, calls `LanguageSession::set_env`, and replies `set_env_reply` without emitting IOPub status; string values set variables and `null` unsets them. Languages that do not implement `set_env` return `ErrorKind::Unavailable`, which replies with `SetEnvNotSupported`.
 
 ## Kernel operations
 

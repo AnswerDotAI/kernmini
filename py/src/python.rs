@@ -10,6 +10,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyString, PyTuple};
 use pyo3_async_runtimes::TaskLocals;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::mem;
 use std::path::PathBuf;
 use std::ptr;
@@ -496,6 +497,20 @@ impl LanguageSession for PyLanguageSession {
             let awaitable = bridge.call_method1("message", (target.bind(py), sink, message.msg_type, json_to_py(py, &message.content)?, buffers))?;
             pyo3_async_runtimes::into_future_with_locals(&locals, awaitable)
         }).await?;
+        future.await.map_err(Error::adapter)?;
+        Ok(())
+    }
+
+    async fn set_env(&self, env: HashMap<String, Option<String>>) -> Result<()> {
+        let (target, locals) = (self.target.clone(), self.locals.clone());
+        let future = attach(move |py| {
+            if !target.bind(py).hasattr("set_env")? { return Ok(None); }
+            let py_env = PyDict::new(py);
+            for (k, v) in env { py_env.set_item(k, v)?; }
+            let awaitable = py.import("kernmini._bridge")?.call_method1("set_env", (target.bind(py), py_env))?;
+            pyo3_async_runtimes::into_future_with_locals(&locals, awaitable).map(Some)
+        }).await?;
+        let Some(future) = future else { return Err(Error::new(ErrorKind::Unavailable, "set_env is not supported")); };
         future.await.map_err(Error::adapter)?;
         Ok(())
     }

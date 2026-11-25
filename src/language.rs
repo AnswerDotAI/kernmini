@@ -2,6 +2,7 @@ use crate::{Error, ErrorKind, Result};
 use async_trait::async_trait;
 use mpsc::UnboundedSender;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
@@ -163,6 +164,7 @@ pub trait LanguageSession: Clone + Send + Sync + 'static {
     async fn comm_info(&self, _request: Value) -> Result<Value> { Ok(reply_defaults::comm_info()) }
     async fn debug(&self, _request: Value) -> Result<Value> { Ok(reply_defaults::debug()) }
     async fn message(&self, _message: LanguageMessage, _context: ExecutionContext) -> Result<()> { Ok(()) }
+    async fn set_env(&self, _env: HashMap<String, Option<String>>) -> Result<()> { Err(Error::new(ErrorKind::Unavailable, "set_env is not supported")) }
     async fn shutdown(&self) -> Result<()> { Ok(()) }
 }
 
