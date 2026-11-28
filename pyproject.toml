@@ -41,6 +41,7 @@ Homepage = "https://github.com/AnswerDotAI/kernmini"
 Repository = "https://github.com/AnswerDotAI/kernmini"
 Issues = "https://github.com/AnswerDotAI/kernmini/issues"
 
+Documentation = "https://AnswerDotAI.github.io/kernmini/"
 [tool.maturin]
 manifest-path = "py/Cargo.toml"
 python-source = "."
